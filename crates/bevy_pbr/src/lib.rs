@@ -409,6 +409,10 @@ impl Plugin for PbrPlugin {
                 ),
             )
             .init_gpu_resource::<LightMeta>()
+            // Persistent point-light shadow atlas backing `CachedShadowMap` shadow caching. Uses
+            // `init_gpu_resource` (not `init_resource`) so it is reset to `Default` (empty texture,
+            // reallocated on next `prepare_lights`) on render-device-loss recovery.
+            .init_gpu_resource::<PointLightShadowAtlasCache>()
             .init_gpu_resource::<RenderMaterialBindings>()
             .init_resource::<RenderShadowLodOrigin>()
             .allow_ambiguous_resource::<RenderMaterialBindings>();

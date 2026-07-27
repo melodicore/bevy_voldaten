@@ -93,6 +93,46 @@ pub struct ExtractedPointLight {
     pub soft_shadows_enabled: bool,
     /// whether this point light contributes diffuse light to lightmapped meshes
     pub affects_lightmapped_mesh_diffuse: bool,
+    /// `Some(dirty)` if this light has a [`CachedShadowMap`] component (shadow-map caching enabled),
+    /// `None` otherwise (re-render every frame, stock behaviour). When `Some(false)` and the engine
+    /// can guarantee the cached atlas slice is still valid, this light's cube shadow map is not
+    /// re-rendered this frame — its previously rendered depth is retained and reused instead.
+    pub shadow_cache: Option<bool>,
+}
+
+/// Enables shadow-map caching for a point light. When present on a point light entity, that light's
+/// cube shadow map is only re-rendered on frames where `dirty` is `true`; on other frames the
+/// previously rendered map is retained and reused, skipping *all* per-view shadow work for the light
+/// (visibility, queueing, GPU preprocessing, and the depth pass). Absent = stock behaviour
+/// (re-render every frame). Only affects point lights (spot/directional are unaffected).
+///
+/// `dirty` is the application's signal that something affecting this light's shadow changed this
+/// frame — the light itself moved, or a shadow caster in view of it moved/changed shape. The engine
+/// does not try to infer this; set it from whatever knowledge the application has. The engine
+/// *additionally* forces a re-render regardless of `dirty` whenever it cannot guarantee the cached
+/// slice is still valid: the shadow atlas was reallocated, or the set/order of shadow-casting point
+/// lights changed this frame (which would otherwise shift atlas slots).
+///
+/// For change detection to gate extraction correctly, mutate this component only when `dirty`
+/// actually changes value (write `true`→`false` / `false`→`true`, not the same value every frame).
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct CachedShadowMap {
+    pub dirty: bool,
+}
+
+/// Persistent point-light shadow depth atlas backing [`CachedShadowMap`]. Unlike the default
+/// per-frame [`TextureCache`] allocation, this texture is retained across frames so a cached (clean)
+/// light's slice keeps its previously rendered depth and need not be re-rendered. Reallocated only
+/// when its descriptor (shadow-map size or casting-light count) changes; a realloc invalidates every
+/// slice and forces a full re-render that frame. Render-world only.
+#[derive(Resource, Default)]
+pub struct PointLightShadowAtlasCache {
+    texture: Option<Texture>,
+    size: u32,
+    layers: u32,
+    /// Main entities of shadow-casting point lights in slot order, as of last frame. If this differs
+    /// this frame, slot assignments shifted, so every slice is re-rendered regardless of `dirty`.
+    order: Vec<MainEntity>,
 }
 
 #[derive(Component, Debug)]
@@ -331,6 +371,7 @@ pub fn extract_lights(
                 &ViewVisibility,
                 &CubemapFrusta,
                 Option<&VolumetricLight>,
+                Option<&CachedShadowMap>,
             ),
             Or<(
                 Changed<PointLight>,
@@ -339,6 +380,7 @@ pub fn extract_lights(
                 Changed<ViewVisibility>,
                 Changed<CubemapFrusta>,
                 Changed<VolumetricLight>,
+                Changed<CachedShadowMap>,
             )>,
         >,
     >,
@@ -451,6 +493,7 @@ pub fn extract_lights(
         view_visibility,
         frusta,
         volumetric_light,
+        cached_shadow_map,
     ) in point_lights.iter()
     {
         if !view_visibility.get() {
@@ -542,6 +585,7 @@ pub fn extract_lights(
             spot_light_angles: None,
             volumetric: volumetric_light.is_some(),
             affects_lightmapped_mesh_diffuse: point_light.affects_lightmapped_mesh_diffuse,
+            shadow_cache: cached_shadow_map.map(|c| c.dirty),
             #[cfg(feature = "experimental_pbr_pcss")]
             soft_shadows_enabled: point_light.soft_shadows_enabled,
             #[cfg(not(feature = "experimental_pbr_pcss"))]
@@ -655,6 +699,7 @@ pub fn extract_lights(
             spot_light_angles: Some((spot_light.inner_angle, spot_light.outer_angle)),
             volumetric: volumetric_light.is_some(),
             affects_lightmapped_mesh_diffuse: spot_light.affects_lightmapped_mesh_diffuse,
+            shadow_cache: None,
             #[cfg(feature = "experimental_pbr_pcss")]
             soft_shadows_enabled: spot_light.soft_shadows_enabled,
             #[cfg(not(feature = "experimental_pbr_pcss"))]
@@ -1038,9 +1083,10 @@ pub fn prepare_lights(
         Query<&mut DirectionalLightViewEntities>,
     ),
     sorted_cameras: Res<SortedCameras>,
-    (gpu_preprocessing_support, decals): (
+    (gpu_preprocessing_support, decals, mut point_light_shadow_atlas): (
         Res<GpuPreprocessingSupport>,
         Option<Res<RenderClusteredDecals>>,
+        ResMut<PointLightShadowAtlasCache>,
     ),
     (existing_shadow_views, mut light_key_cache, mut specialized_shadow_material_pipeline_cache): (
         Query<&ShadowView>,
@@ -1362,13 +1408,20 @@ pub fn prepare_lights(
     let mut point_light_depth_attachments = HashMap::<u32, DepthAttachment>::default();
     let mut directional_light_depth_attachments = HashMap::<u32, DepthAttachment>::default();
 
-    let point_light_depth_texture = texture_cache.get(
-        &render_device,
-        TextureDescriptor {
+    // Persistent point-light shadow atlas (see `PointLightShadowAtlasCache` / `CachedShadowMap`):
+    // retained across frames so a cached (clean) light's slice keeps its depth. Reallocated only when
+    // the descriptor changes; a realloc clears `order`, forcing a full re-render this frame below.
+    let point_light_atlas_size = point_light_shadow_map.size as u32;
+    let point_light_atlas_layers = point_light_shadow_maps_count.max(1) as u32 * 6;
+    if point_light_shadow_atlas.texture.is_none()
+        || point_light_shadow_atlas.size != point_light_atlas_size
+        || point_light_shadow_atlas.layers != point_light_atlas_layers
+    {
+        point_light_shadow_atlas.texture = Some(render_device.create_texture(&TextureDescriptor {
             size: Extent3d {
-                width: point_light_shadow_map.size as u32,
-                height: point_light_shadow_map.size as u32,
-                depth_or_array_layers: point_light_shadow_maps_count.max(1) as u32 * 6,
+                width: point_light_atlas_size,
+                height: point_light_atlas_size,
+                depth_or_array_layers: point_light_atlas_layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -1377,12 +1430,15 @@ pub fn prepare_lights(
             label: Some("point_light_shadow_map_texture"),
             usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        },
-    );
+        }));
+        point_light_shadow_atlas.size = point_light_atlas_size;
+        point_light_shadow_atlas.layers = point_light_atlas_layers;
+        point_light_shadow_atlas.order.clear();
+    }
+    let point_light_depth_texture = point_light_shadow_atlas.texture.clone().unwrap();
 
     let point_light_depth_texture_view =
         point_light_depth_texture
-            .texture
             .create_view(&TextureViewDescriptor {
                 label: Some("point_light_shadow_map_array_texture_view"),
                 format: None,
@@ -1457,6 +1513,17 @@ pub fn prepare_lights(
     let mut live_views = EntityHashSet::with_capacity(views_count);
 
     // TODO: this should select lights based on relevance to the view instead of the first ones that show up in a query
+    // Detect whether the shadow-casting point-light set/order changed since last frame. Atlas slots
+    // are the sorted enumeration index, so a change means slots may now belong to different lights —
+    // force every casting light to re-render this frame (ignoring `CachedShadowMap::dirty`).
+    let point_light_casting_order: Vec<MainEntity> = point_light_entities
+        .iter()
+        .take(point_light_count.min(max_texture_cubes))
+        .map(|e| *point_lights.get(*e).unwrap().1)
+        .collect();
+    let force_all_point_shadows = point_light_casting_order != point_light_shadow_atlas.order;
+    point_light_shadow_atlas.order = point_light_casting_order;
+
     for light_entity in point_light_entities
         .iter()
         // Lights are sorted, shadow enabled lights are first
@@ -1471,6 +1538,27 @@ pub fn prepare_lights(
         ) = point_lights.get_mut(*light_entity).unwrap();
 
         if !light.shadow_maps_enabled {
+            despawn_entities(
+                &mut commands,
+                mem::take(&mut point_and_spot_light_view_entities.0),
+            );
+            continue;
+        }
+
+        // Shadow-map caching: a light with a `CachedShadowMap` reporting clean (and whose slice is
+        // still valid — no atlas realloc / order change this frame) reuses its retained depth slice.
+        // We despawn its shadow-view entities (like the `!shadow_maps_enabled` branch above) so no
+        // stale per-face views linger for `queue_shadows`/the shadow pass to process, and skip
+        // preparing/marking-live its phases — so no per-view shadow work runs and the persistent
+        // atlas slice keeps its previously rendered depth. The light still samples that slice via its
+        // stable atlas index (`light_index * 6`), computed elsewhere. Lights without the component
+        // (`shadow_cache == None`) always render — identical to stock behaviour.
+        let should_render_shadow = force_all_point_shadows
+            || match light.shadow_cache {
+                None => true,
+                Some(dirty) => dirty,
+            };
+        if !should_render_shadow {
             despawn_entities(
                 &mut commands,
                 mem::take(&mut point_and_spot_light_view_entities.0),
@@ -1498,8 +1586,9 @@ pub fn prepare_lights(
             );
 
             point_and_spot_light_view_entities.0 = light_view_entities;
-        } else if changed_point_lights.get(*light_entity).is_ok() {
-            // Update the point shadow maps with the changes.
+        } else if force_all_point_shadows || changed_point_lights.get(*light_entity).is_ok() {
+            // Update the point shadow maps with the changes (or unconditionally when a slot-order
+            // change forced a re-render, since the existing views may reference a now-stale slot).
             create_point_shadow_maps(
                 &mut commands,
                 &mut point_light_depth_attachments,
@@ -1957,7 +2046,7 @@ pub fn prepare_lights(
 
         commands.entity(entity).insert((
             ViewShadowBindings {
-                point_light_depth_texture: point_light_depth_texture.texture.clone(),
+                point_light_depth_texture: point_light_depth_texture.clone(),
                 point_light_depth_texture_view: point_light_depth_texture_view.clone(),
                 directional_light_depth_texture: directional_light_depth_texture.texture.clone(),
                 directional_light_depth_texture_view: directional_light_depth_texture_view.clone(),
@@ -2006,7 +2095,7 @@ fn create_point_shadow_maps(
         Option<&CubemapFrusta>,
         &Vec<Entity>,
     ),
-    point_light_depth_texture: &CachedTexture,
+    point_light_depth_texture: &Texture,
     (light_entity, light_main_entity, light): (&Entity, &MainEntity, &ExtractedPointLight),
     point_light_shadow_map_size: u32,
     gpu_preprocessing_support_max_supported_mode: GpuPreprocessingMode,
@@ -2039,7 +2128,6 @@ fn create_point_shadow_maps(
             .or_insert_with(|| {
                 let depth_texture_view =
                     point_light_depth_texture
-                        .texture
                         .create_view(&TextureViewDescriptor {
                             label: Some("point_light_shadow_map_texture_view"),
                             format: None,
