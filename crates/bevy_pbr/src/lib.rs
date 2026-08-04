@@ -58,7 +58,8 @@ use bevy_color::{Color, LinearRgba};
 
 pub use atmosphere::*;
 use bevy_light::{
-    AmbientLight, DirectionalLight, PointLight, RectLight, ShadowFilteringMethod, SpotLight,
+    AmbientLight, DirectionalLight, PointLight, RectLight, ShadowFilteringMethod,
+    ShadowRotationCompensation, SpotLight,
 };
 use bevy_shader::{load_shader_library, ShaderRef};
 pub use cluster::*;
@@ -376,6 +377,7 @@ impl Plugin for PbrPlugin {
                 ExtractSchedule,
                 (
                     extract_lights,
+                    extract_shadow_rotation_compensation,
                     extract_ambient_light_resource,
                     extract_ambient_light,
                     extract_shadow_filtering_method,
@@ -403,7 +405,12 @@ impl Plugin for PbrPlugin {
             // `init_gpu_resource` (not `init_resource`) so it is reset to `Default` (empty texture,
             // reallocated on next `prepare_lights`) on render-device-loss recovery.
             .init_gpu_resource::<PointLightShadowAtlasCache>()
-            .init_resource::<RenderShadowLodOrigin>();
+            .init_resource::<RenderShadowLodOrigin>()
+            // Render-world copy, kept in sync every frame by `extract_shadow_rotation_compensation`
+            // (a manual extract system rather than the usual `ExtractResourcePlugin`, since
+            // `ShadowRotationCompensation` is defined in `bevy_light`, which has no `bevy_render`
+            // dependency to derive `ExtractResource` against — see that type's own doc comment).
+            .init_resource::<ShadowRotationCompensation>();
 
         render_app
             .world_mut()
