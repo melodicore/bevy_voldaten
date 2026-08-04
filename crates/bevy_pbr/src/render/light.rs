@@ -25,7 +25,8 @@ use bevy_light::SunDisk;
 use bevy_light::{
     spot_light_clip_from_view, spot_light_world_from_view, AmbientLight, CascadeShadowConfig,
     Cascades, DirectionalLight, DirectionalLightShadowMap, GlobalAmbientLight, PointLight,
-    PointLightShadowMap, RectLight, ShadowFilteringMethod, SpotLight, VolumetricLight,
+    PointLightShadowMap, RectLight, ShadowFilteringMethod, ShadowRotationCompensation, SpotLight,
+    VolumetricLight,
 };
 use bevy_material::{
     key::{ErasedMaterialPipelineKey, ErasedMeshPipelineKey},
@@ -34,7 +35,7 @@ use bevy_material::{
 use bevy_math::{
     ops,
     primitives::{HalfSpace, ViewFrustum},
-    Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles,
+    Mat3, Mat4, UVec4, Vec3, Vec3Swizzles, Vec4, Vec4Swizzles,
 };
 use bevy_mesh::{Mesh3d, MeshVertexBufferLayoutRef};
 use bevy_platform::collections::{HashMap, HashSet};
@@ -248,6 +249,13 @@ pub struct GpuLights {
     ambient_light_affects_lightmapped_meshes: u32,
     n_rect_lights: u32,
     rect_lights: [GpuRectLight; MAX_RECT_LIGHTS],
+    /// Inverse of the current frame's `ShadowRotationCompensation` — see that resource's own doc
+    /// comment. Applied in `shadows.wgsl::fetch_point_shadow` to the world-space light→fragment
+    /// query direction before indexing a point light's cube shadow map, undoing (for sampling
+    /// purposes only) whatever extra rotation `create_point_shadow_maps` composed into that map's
+    /// render-time view basis. Identity when `ShadowRotationCompensation` is unused (its default),
+    /// making this whole mechanism a no-op unless the application actively sets it.
+    shadow_rotation_inverse: Mat3,
 }
 
 // NOTE: When running bevy on Adreno GPU chipsets in WebGL, any value above 1 will result in a crash
@@ -354,6 +362,20 @@ pub fn extract_ambient_light(
     }
     *previous_len = values.len();
     commands.try_insert_batch(values);
+}
+
+/// Mirrors `bevy_light::ShadowRotationCompensation` (a plain, non-`ExtractResource` resource —
+/// see its own doc comment for why: `bevy_light` has no `bevy_render` dependency to derive
+/// against) from the main world into the render world every frame, so `prepare_lights`/
+/// `create_point_shadow_maps` can read the same value `update_point_light_frusta`
+/// (main-world-side, in `bevy_light`) used to build this frame's culling frusta.
+pub fn extract_shadow_rotation_compensation(
+    main_world: Extract<Res<ShadowRotationCompensation>>,
+    mut render_world: ResMut<ShadowRotationCompensation>,
+) {
+    if render_world.0 != main_world.0 {
+        render_world.0 = main_world.0;
+    }
 }
 
 pub fn extract_lights(
@@ -1029,6 +1051,7 @@ pub fn prepare_lights(
     (render_device, render_queue): (Res<RenderDevice>, Res<RenderQueue>),
     mut global_clusterable_object_meta: ResMut<GlobalClusterableObjectMeta>,
     mut light_meta: ResMut<LightMeta>,
+    shadow_rotation: Res<ShadowRotationCompensation>,
     views: Query<
         (
             Entity,
@@ -1104,10 +1127,17 @@ pub fn prepare_lights(
         return;
     };
 
-    // Pre-calculate for PointLights
+    // Pre-calculate for PointLights. `ShadowRotationCompensation` is composed *outside* (applied
+    // after) the fixed-axis face rotation — see that resource's own doc comment for the full
+    // derivation of why this exact composition is what makes a `CachedShadowMap`-clean light's
+    // retained cube map remain valid under a rigid rotation of its caster set, and why applying it
+    // unconditionally here (not just for cached lights) is a no-op for any light that re-renders
+    // every frame regardless.
     let cube_face_rotations = CUBE_MAP_FACES
         .iter()
-        .map(|CubeMapFace { target, up }| Transform::IDENTITY.looking_at(*target, *up))
+        .map(|CubeMapFace { target, up }| {
+            Transform::from_rotation(shadow_rotation.0) * Transform::IDENTITY.looking_at(*target, *up)
+        })
         .collect::<Vec<_>>();
 
     global_clusterable_object_meta.entity_to_index.clear();
@@ -1827,6 +1857,7 @@ pub fn prepare_lights(
                 as u32,
             n_rect_lights: 0,
             rect_lights: [GpuRectLight::default(); MAX_RECT_LIGHTS],
+            shadow_rotation_inverse: Mat3::from_quat(shadow_rotation.0.inverse()),
         };
 
         // directional lights

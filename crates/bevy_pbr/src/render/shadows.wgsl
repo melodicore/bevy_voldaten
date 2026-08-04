@@ -27,19 +27,29 @@ fn fetch_point_shadow(
     // because the shadow maps align with the axes and the frustum planes are at 45 degrees
     // we can get the worldspace depth by taking the largest absolute axis
     let surface_to_light = (*light).position_radius.xyz - frag_position.xyz;
-    let surface_to_light_abs = abs(surface_to_light);
+    // `shadow_rotation_inverse` rotates a true world-space direction into the frame this cube
+    // shadow map's faces are actually aligned to (see the Rust-side `ShadowRotationCompensation`
+    // doc comment) — identity, i.e. a no-op, unless the application is using that mechanism. The
+    // "largest absolute axis" shortcuts below are only valid measured in *that* frame, since they
+    // rely on the vector being axis-aligned with the cube's own faces.
+    let surface_to_light_local = view_bindings::lights.shadow_rotation_inverse * surface_to_light;
+    let surface_to_light_abs = abs(surface_to_light_local);
     let distance_to_light = max(surface_to_light_abs.x, max(surface_to_light_abs.y, surface_to_light_abs.z));
 
     // The normal bias here is already scaled by the texel size at 1 world unit from the light.
     // The texel size increases proportionally with distance from the light so multiplying by
     // distance to light scales the normal bias to the texel size at the fragment distance.
+    // `normal_offset`/`depth_offset` are genuine world-space position adjustments, so they're
+    // computed from `surface_to_light` (world space), not the rotated local-frame version above.
     let normal_offset = (*light).shadow_normal_bias * distance_to_light * surface_normal.xyz;
     let depth_offset = (*light).shadow_depth_bias * normalize(surface_to_light.xyz);
     let offset_position = frag_position.xyz + normal_offset + depth_offset;
 
-    // similar largest-absolute-axis trick as above, but now with the offset fragment position
-    let frag_ls = offset_position.xyz - (*light).position_radius.xyz ;
-    let abs_position_ls = abs(frag_ls);
+    // similar largest-absolute-axis trick as above, but now with the offset fragment position —
+    // same local-frame rotation needed, same reason.
+    let frag_ls = offset_position.xyz - (*light).position_radius.xyz;
+    let frag_ls_local = view_bindings::lights.shadow_rotation_inverse * frag_ls;
+    let abs_position_ls = abs(frag_ls_local);
     let major_axis_magnitude = max(abs_position_ls.x, max(abs_position_ls.y, abs_position_ls.z));
 
     // NOTE: These simplifications come from multiplying:
@@ -54,7 +64,7 @@ fn fetch_point_shadow(
     // sampling.
     if ((*light).soft_shadow_size > 0.0) {
         return sample_shadow_cubemap_pcss(
-            frag_ls * flip_z,
+            frag_ls_local * flip_z,
             distance_to_light,
             depth,
             light_id,
@@ -65,7 +75,7 @@ fn fetch_point_shadow(
 
     // Do the lookup, using HW PCF and comparison. Cubemaps assume a left-handed
     // coordinate space, so we have to flip the z-axis when sampling.
-    return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, light_id, frag_coord_xy);
+    return sample_shadow_cubemap(frag_ls_local * flip_z, distance_to_light, depth, light_id, frag_coord_xy);
 }
 
 fn fetch_spot_shadow(

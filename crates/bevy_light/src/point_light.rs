@@ -6,7 +6,7 @@ use bevy_camera::{
 use bevy_color::Color;
 use bevy_ecs::prelude::*;
 use bevy_image::Image;
-use bevy_math::{primitives::ViewFrustum, Mat4};
+use bevy_math::{primitives::ViewFrustum, Mat4, Quat};
 use bevy_reflect::prelude::*;
 use bevy_transform::components::{GlobalTransform, Transform};
 
@@ -207,9 +207,38 @@ pub fn update_point_light_bounding_spheres(
     }
 }
 
+/// A single global rotation, applied to every point light's cube shadow map, that lets a
+/// shadow-map-caching-enabled light's retained cube map survive a *rigid* rotation of its whole
+/// caster set without re-rendering — set by the application, defaults to `Quat::IDENTITY` (a
+/// no-op) when unused. See `bevy_pbr::render::light`'s `create_point_shadow_maps` (the render-time
+/// consumer, which composes this into the actual view basis used to rasterize each cube face) and
+/// `bevy_pbr::render::shadows.wgsl`'s `fetch_point_shadow` (the sample-time consumer, which
+/// applies the inverse) for the full derivation of why this exact composition works.
+///
+/// **Defined here, not in `bevy_pbr`, specifically so `update_point_light_frusta` below can read
+/// it too** — the *culling* frustum computed here and the *render* view basis computed in
+/// `bevy_pbr` must apply the identical rotation, or a light's shadow-casting mesh selection
+/// (this function) silently diverges from what its shadow map actually rasterizes (`bevy_pbr`),
+/// which — confirmed the hard way — produces genuinely wrong shadows (occluders that should
+/// appear get culled out, occluders that shouldn't get let through) rather than merely a stale
+/// cache: real geometric drift, worse the more the compensation rotation has accumulated.
+/// `bevy_light` has no dependency on `bevy_render`, so this is a plain `Resource`, not
+/// `ExtractResource` — `bevy_pbr` mirrors its value into the render world with its own small
+/// manual extract system instead of the usual derive, since deriving `ExtractResource` for a
+/// foreign type from a downstream crate isn't possible (Rust's orphan rule).
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct ShadowRotationCompensation(pub Quat);
+
+impl Default for ShadowRotationCompensation {
+    fn default() -> Self {
+        Self(Quat::IDENTITY)
+    }
+}
+
 // NOTE: Run this after assign_lights_to_clusters!
 /// Updates the frusta for all visible shadow mapped [`PointLight`]s.
 pub fn update_point_light_frusta(
+    shadow_rotation: Res<ShadowRotationCompensation>,
     mut views: Query<
         (
             &GlobalTransform,
@@ -224,9 +253,16 @@ pub fn update_point_light_frusta(
         )>,
     >,
 ) {
+    // `ShadowRotationCompensation` composed on top of the fixed axes, exactly mirroring
+    // `bevy_pbr::render::light::create_point_shadow_maps`'s own `cube_face_rotations` — this
+    // culling frustum and that render view basis must always agree, or shadow-casting mesh
+    // selection silently diverges from what's actually rasterized. See this type's own doc
+    // comment.
     let view_rotations = CUBE_MAP_FACES
         .iter()
-        .map(|CubeMapFace { target, up }| Transform::IDENTITY.looking_at(*target, *up))
+        .map(|CubeMapFace { target, up }| {
+            Transform::from_rotation(shadow_rotation.0) * Transform::IDENTITY.looking_at(*target, *up)
+        })
         .collect::<Vec<_>>();
 
     for (transform, point_light, mut cubemap_frusta, view_visibility) in &mut views {
