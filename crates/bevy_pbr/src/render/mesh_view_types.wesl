@@ -83,6 +83,12 @@ struct Lights {
     ambient_light_flags: u32,
     n_rect_lights: u32,
     rect_lights: array<RectLight, u32(constants::MAX_RECT_LIGHTS)>,
+    // Inverse of the current frame's world-rotation shadow compensation (see Rust-side
+    // `ShadowRotationCompensation`'s doc comment) — identity when unused. Applied to a point
+    // light's shadow query direction in `shadows::fetch_point_shadow` before sampling its cube
+    // shadow map, undoing whatever extra rotation was composed into that map's render-time view
+    // basis so a retained (not re-rendered this frame) map still samples correctly.
+    shadow_rotation_inverse: mat3x3<f32>,
 };
 
 const AMBIENT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESHES_BIT: u32           = 1u << 0u;

@@ -50,6 +50,7 @@ pub use cascade::{CascadeShadowConfig, CascadeShadowConfigBuilder, Cascades};
 mod point_light;
 pub use point_light::{
     update_point_light_frusta, PointLight, PointLightShadowMap, PointLightTexture,
+    ShadowRotationCompensation,
 };
 mod spot_light;
 pub use spot_light::{
@@ -167,6 +168,7 @@ impl Plugin for LightPlugin {
         app.init_resource::<GlobalAmbientLight>()
             .init_resource::<DirectionalLightShadowMap>()
             .init_resource::<PointLightShadowMap>()
+            .init_resource::<ShadowRotationCompensation>()
             .init_asset::<ScatteringMedium>()
             .register_required_components::<Camera3d, Clusters>()
             .configure_sets(
