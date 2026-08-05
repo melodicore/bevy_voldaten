@@ -190,6 +190,7 @@ impl Plugin for PbrPlugin {
         load_shader_library!(app, "light_probe.wesl");
         load_shader_library!(app, "render/utils.wesl");
         load_shader_library!(app, "render/clustered_forward.wesl");
+        load_shader_library!(app, "render/light_falloff.wesl");
         load_shader_library!(app, "render/pbr_lighting.wesl");
         load_shader_library!(app, "render/shadows.wesl");
         load_shader_library!(app, "deferred/types.wesl");
