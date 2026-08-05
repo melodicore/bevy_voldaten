@@ -193,6 +193,7 @@ impl Plugin for PbrPlugin {
         load_shader_library!(app, "render/pbr_bindings.wgsl");
         load_shader_library!(app, "render/utils.wgsl");
         load_shader_library!(app, "render/clustered_forward.wgsl");
+        load_shader_library!(app, "render/light_falloff.wgsl");
         load_shader_library!(app, "render/pbr_lighting.wgsl");
         load_shader_library!(app, "render/shadows.wgsl");
         load_shader_library!(app, "deferred/pbr_deferred_types.wgsl");

@@ -5,6 +5,7 @@
     mesh_view_bindings as view_bindings,
     atmosphere::functions::{calculate_visible_sun_ratio, clamp_to_surface},
     atmosphere::bruneton_functions::transmittance_lut_r_mu_to_uv,
+    light_falloff::apply_light_falloff,
 }
 #import bevy_render::maths::{PI, orthonormalize}
 
@@ -649,7 +650,7 @@ fn point_light(
     let L = normalize(light_to_frag);
     let distance_square = dot(light_to_frag, light_to_frag);
     let distance = sqrt(distance_square);
-    let rangeAttenuation = getDistanceAttenuation(distance_square, (*light).color_inverse_square_range.w);
+    let rangeAttenuation = apply_light_falloff(getDistanceAttenuation(distance_square, (*light).color_inverse_square_range.w));
 
     // Base layer
 
