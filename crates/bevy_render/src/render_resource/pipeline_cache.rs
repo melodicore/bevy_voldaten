@@ -15,7 +15,7 @@ use bevy_ecs::{
     resource::Resource,
     system::{Res, ResMut},
 };
-use bevy_log::error;
+use bevy_log::{error, info};
 use bevy_platform::collections::{HashMap, HashSet};
 use bevy_shader::{
     CachedPipelineId, Shader, ShaderCache, ShaderCacheError, ShaderCacheSource, ShaderDefVal,
@@ -23,9 +23,26 @@ use bevy_shader::{
 };
 use bevy_tasks::Task;
 use bevy_utils::default;
-use core::{future::Future, mem};
+use core::{
+    future::Future,
+    mem,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use std::sync::{Mutex, PoisonError};
 use wgpu::{PipelineCompilationOptions, VertexBufferLayout as RawVertexBufferLayout};
+
+/// Diagnostic gate for `voldaten` (not part of upstream Bevy): when `true`,
+/// `start_create_render_pipeline` logs every pipeline it compiles, including its `shader_defs` —
+/// used to pinpoint gaps in `render/shader_warmup.rs`'s Booting-time warm-up coverage. Defaults
+/// `false` (silent) so the large, *expected* compile burst during that warm-up itself doesn't
+/// spam the console; `voldaten`'s `ui/loading_screen.rs::advance_booting_to_title` flips this to
+/// `true` itself the instant `Booting` exits, so anything that still needs to compile lazily
+/// *after* the loading screen — a real, unintended warm-up gap — stands out immediately in the
+/// log instead of being buried in expected boot-time noise. A plain `static AtomicBool` (not a
+/// `Resource`) specifically so it's trivially reachable from this render-app-side code without
+/// needing an `ExtractResource`/main-world round-trip, and so it works correctly regardless of
+/// whether the render app is pipelined onto its own thread.
+pub static LOG_LATE_PIPELINE_COMPILES: AtomicBool = AtomicBool::new(false);
 
 /// A pipeline defining the data layout and shader logic for a specific GPU task.
 ///
@@ -482,8 +499,35 @@ impl PipelineCache {
             })
             .collect::<Vec<_>>();
 
+        // Diagnostic (voldaten) — gated by `LOG_LATE_PIPELINE_COMPILES` (see its own doc comment)
+        // so this only actually logs for pipelines compiled after `Booting` has exited, when a
+        // fresh compile means a real `render/shader_warmup.rs` coverage gap rather than expected
+        // boot-time noise. Captured before `descriptor` is shadowed below by the raw
+        // wgpu-facing descriptor, since shader_defs is what actually distinguishes one compiled
+        // pipeline permutation from another (the label alone is too coarse — many distinct
+        // permutations share the same generic label). The `format!` calls are skipped entirely
+        // when the gate is off, so this costs nothing during the (silent, expected) warm-up
+        // burst itself.
+        let diag = LOG_LATE_PIPELINE_COMPILES.load(Ordering::Relaxed).then(|| {
+            (
+                descriptor.label.clone(),
+                descriptor.vertex.shader.path().map(|p| p.to_string()),
+                format!("{:?}", descriptor.vertex.shader_defs),
+                descriptor.fragment.as_ref().and_then(|f| f.shader.path()).map(|p| p.to_string()),
+                descriptor.fragment.as_ref().map(|f| format!("{:?}", f.shader_defs)),
+            )
+        });
+
         create_pipeline_task(
             async move {
+                if let Some((label, vertex_shader, vertex_defs, fragment_shader, fragment_defs)) = diag {
+                    info!(
+                        "[pipeline_cache] compiling render pipeline (post-boot): label={label:?} \
+                         vertex_shader={vertex_shader:?} vertex_defs={vertex_defs} \
+                         fragment_shader={fragment_shader:?} fragment_defs={fragment_defs:?}"
+                    );
+                }
+
                 let mut shader_cache = shader_cache.lock().unwrap();
                 let mut layout_cache = layout_cache.lock().unwrap();
 
