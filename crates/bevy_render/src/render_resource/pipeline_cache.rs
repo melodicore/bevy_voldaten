@@ -697,8 +697,39 @@ impl PipelineCache {
             }
         }
 
+        // Phase 1: advance every waiting pipeline one state-machine step. A `Queued` pipeline
+        // now always gets spawned onto AsyncComputeTaskPool (see create_pipeline_task below)
+        // instead of blocking here, so every compile starts running concurrently the instant
+        // it's queued, and this loop itself stays cheap regardless of pipeline count — this is
+        // what lets pipeline compilation actually use more than one core even when
+        // `synchronous_pipeline_compilation` is set (see phase 2 below for why that flag no
+        // longer needs a fully-sequential compile loop to keep its blocking contract).
+        let mut just_spawned = Vec::new();
         for id in waiting_pipelines {
+            let was_queued = matches!(pipelines[id].state, CachedPipelineState::Queued);
             self.process_pipeline(&mut pipelines[id], id);
+            if was_queued && matches!(pipelines[id].state, CachedPipelineState::Creating(_)) {
+                just_spawned.push(id);
+            }
+        }
+
+        // Phase 2: only in sync mode, block until every pipeline *this call* just spawned has
+        // finished, so process_queue still doesn't return until everything queued this frame is
+        // done (preserving the exact blocking contract voldaten's RenderStall boot-gate
+        // mechanism relies on). They've already been compiling concurrently since phase 1
+        // spawned them, so this just drains results one by one — process_pipeline's existing
+        // (unchanged) reinsert-into-waiting_pipelines bookkeeping from phase 1 already covers
+        // next-call retry/terminal-error classification for these ids, so phase 2 only needs to
+        // resolve Creating -> Ok/Err.
+        if self.synchronous_pipeline_compilation {
+            for id in just_spawned {
+                if let CachedPipelineState::Creating(task) = &mut pipelines[id].state {
+                    pipelines[id].state = match bevy_tasks::block_on(task) {
+                        Ok(pipeline) => CachedPipelineState::Ok(pipeline),
+                        Err(err) => CachedPipelineState::Err(err),
+                    };
+                }
+            }
         }
 
         self.pipelines = pipelines;
@@ -853,12 +884,22 @@ fn pipeline_error_context(cached_pipeline: &CachedPipeline) -> String {
 ))]
 fn create_pipeline_task(
     task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
-    sync: bool,
+    _sync: bool,
 ) -> CachedPipelineState {
-    if !sync {
-        return CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(task));
-    }
+    // Always spawn onto AsyncComputeTaskPool, regardless of `sync` — `sync` no longer controls
+    // whether this compile runs concurrently, only whether `process_queue`'s caller blocks until
+    // it (and every other pipeline queued this call) finishes before returning (see
+    // `process_queue`'s phase 2). Spawning is not lazy, so every queued pipeline starts compiling
+    // on a pool worker thread immediately, in parallel with however many others are also queued
+    // this call — this is what lets shader compilation actually use more than one core.
+    CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(task))
+}
 
+#[cfg(any(target_arch = "wasm32", target_os = "macos", not(feature = "multi_threaded")))]
+fn create_pipeline_task(
+    task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
+    _sync: bool,
+) -> CachedPipelineState {
     match bevy_tasks::block_on(task) {
         Ok(pipeline) => CachedPipelineState::Ok(pipeline),
         Err(err) => CachedPipelineState::Err(err),
