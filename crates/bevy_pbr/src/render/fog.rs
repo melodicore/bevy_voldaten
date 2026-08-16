@@ -74,13 +74,13 @@ pub fn prepare_fog(
                     be: Vec3::new(*start, *end, 0.0),
                     ..Default::default()
                 },
-                FogFalloff::Exponential { density } => GpuFog {
+                FogFalloff::Exponential { density, offset } => GpuFog {
                     mode: GPU_FOG_MODE_EXPONENTIAL,
                     base_color: LinearRgba::from(fog.color).to_vec4(),
                     directional_light_color: LinearRgba::from(fog.directional_light_color)
                         .to_vec4(),
                     directional_light_exponent: fog.directional_light_exponent,
-                    be: Vec3::new(*density, 0.0, 0.0),
+                    be: Vec3::new(*density, *offset, 0.0),
                     ..Default::default()
                 },
                 FogFalloff::ExponentialSquared { density } => GpuFog {
