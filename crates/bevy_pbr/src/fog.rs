@@ -186,6 +186,7 @@ pub enum FogFalloff {
     Exponential {
         /// Multiplier applied to the world distance (within the exponential fog falloff calculation).
         density: f32,
+        offset: f32,
     },
 
     /// A squared exponential fog falloff with a given `density`.
@@ -321,6 +322,7 @@ impl FogFalloff {
     pub fn from_visibility_contrast(visibility: f32, contrast_threshold: f32) -> FogFalloff {
         FogFalloff::Exponential {
             density: FogFalloff::koschmieder(visibility, contrast_threshold),
+            offset: 0.0,
         }
     }
 
