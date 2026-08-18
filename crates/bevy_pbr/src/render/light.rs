@@ -2960,7 +2960,10 @@ fn view_shadow_pass<const IS_LATE: bool>(
     });
 
     if let Err(err) = shadow_phase.render(&mut render_pass, world, view_light_entity) {
-        error!("Error encountered while rendering the shadow phase {err:?}");
+        // voldaten diagnostic gate — see `LOG_MESH_BIND_GROUPS_ERRORS`'s own doc comment.
+        if !is_mesh_bind_groups_failure(&err) || LOG_MESH_BIND_GROUPS_ERRORS.load(core::sync::atomic::Ordering::Relaxed) {
+            error!("Error encountered while rendering the shadow phase {err:?}");
+        }
     }
 }
 

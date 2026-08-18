@@ -10,7 +10,7 @@ use bevy_log::info_span;
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
-    render_phase::ViewBinnedRenderPhases,
+    render_phase::{is_mesh_bind_groups_failure, ViewBinnedRenderPhases, LOG_MESH_BIND_GROUPS_ERRORS},
     render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
     renderer::{RenderContext, ViewQuery},
     view::{ExtractedView, ViewDepthTexture, ViewTarget, ViewUniformOffset},
@@ -84,7 +84,10 @@ pub fn main_opaque_pass_3d(
         #[cfg(feature = "trace")]
         let _opaque_main_pass_3d_span = info_span!("opaque_main_pass_3d").entered();
         if let Err(err) = opaque_phase.render(&mut render_pass, world, view_entity) {
-            error!("Error encountered while rendering the opaque phase {err:?}");
+            // voldaten diagnostic gate — see `LOG_MESH_BIND_GROUPS_ERRORS`'s own doc comment.
+            if !is_mesh_bind_groups_failure(&err) || LOG_MESH_BIND_GROUPS_ERRORS.load(core::sync::atomic::Ordering::Relaxed) {
+                error!("Error encountered while rendering the opaque phase {err:?}");
+            }
         }
     }
 
@@ -92,7 +95,10 @@ pub fn main_opaque_pass_3d(
         #[cfg(feature = "trace")]
         let _alpha_mask_main_pass_3d_span = info_span!("alpha_mask_main_pass_3d").entered();
         if let Err(err) = alpha_mask_phase.render(&mut render_pass, world, view_entity) {
-            error!("Error encountered while rendering the alpha mask phase {err:?}");
+            // voldaten diagnostic gate — see `LOG_MESH_BIND_GROUPS_ERRORS`'s own doc comment.
+            if !is_mesh_bind_groups_failure(&err) || LOG_MESH_BIND_GROUPS_ERRORS.load(core::sync::atomic::Ordering::Relaxed) {
+                error!("Error encountered while rendering the alpha mask phase {err:?}");
+            }
         }
     }
 
