@@ -41,6 +41,30 @@ pub trait Draw<P: PhaseItem>: Send + Sync + 'static {
     ) -> Result<(), DrawError>;
 }
 
+/// Diagnostic gate for `voldaten` (not part of upstream Bevy): when `false` (the default), a
+/// `DrawError::RenderCommandFailure` whose message contains "MeshBindGroups" is **not** logged by
+/// `error!` at its call site — this specific failure is a known, self-healing render-thread
+/// corruption class that fires routinely during a heavy `Booting`/`Loading`-time shader-compile
+/// burst (see `boot_gate.rs`'s doc comment in the `voldaten` crate for the full mechanism and its
+/// recovery pulse), and was flooding the console with thousands of identical lines on every
+/// single launch. Every *other* `DrawError` still logs unconditionally regardless of this gate —
+/// only this one specific, already-understood message is silenced, and only while `false`.
+/// `voldaten`'s `ui/loading_screen.rs::advance_loading_to_title` (and its `title.rs::
+/// advance_loading_to_playing` fallback) flip this to `true` once the entire boot+world-load
+/// sequence is done, mirroring `render_resource::pipeline_cache::LOG_LATE_PIPELINE_COMPILES`'s
+/// exact same arm-once-boot-is-over pattern — so the *same* error occurring later, during actual
+/// gameplay, still logs loudly instead of being permanently silenced. A plain `static AtomicBool`
+/// (not a `Resource`) for the identical reason `LOG_LATE_PIPELINE_COMPILES` is one: trivially
+/// reachable from render-app-side code with no `ExtractResource`/main-world round-trip, correct
+/// regardless of whether the render app is pipelined onto its own thread.
+pub static LOG_MESH_BIND_GROUPS_ERRORS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether this `DrawError` is the specific, known-self-healing "MeshBindGroups resource wasn't
+/// set" failure `LOG_MESH_BIND_GROUPS_ERRORS` gates — see that static's own doc comment.
+pub fn is_mesh_bind_groups_failure(err: &DrawError) -> bool {
+    matches!(err, DrawError::RenderCommandFailure(msg) if msg.contains("MeshBindGroups"))
+}
+
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum DrawError {
     #[error("Failed to execute render command {0:?}")]
