@@ -1148,17 +1148,6 @@ fn create_pipeline_task(
     CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(task))
 }
 
-#[cfg(any(target_arch = "wasm32", target_os = "macos", not(feature = "multi_threaded")))]
-fn create_pipeline_task(
-    task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
-    _sync: bool,
-) -> CachedPipelineState {
-    match bevy_tasks::block_on(task) {
-        Ok(pipeline) => CachedPipelineState::Ok(pipeline),
-        Err(err) => CachedPipelineState::Err(err),
-    }
-}
-
 #[cfg(any(
     target_arch = "wasm32",
     target_os = "macos",
