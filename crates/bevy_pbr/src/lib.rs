@@ -214,6 +214,11 @@ impl Plugin for PbrPlugin {
 
         app.register_asset_reflect::<StandardMaterial>()
             .init_resource::<DefaultOpaqueRendererMethod>()
+            // Main-world side of the cascade-fit-view override — see `CascadeViewOverride`'s own
+            // doc comment (`render/light.rs`). A plain resource, not `ExtractResource` (needs
+            // entity remapping on extraction, which a derive can't do) — mirrored into the
+            // render world by `extract_cascade_view_override`.
+            .init_resource::<CascadeViewOverride>()
             .add_plugins((
                 MeshRenderPlugin {
                     use_gpu_instance_buffer_builder: self.use_gpu_instance_buffer_builder,
@@ -389,6 +394,7 @@ impl Plugin for PbrPlugin {
                 (
                     extract_lights,
                     extract_shadow_rotation_compensation,
+                    extract_cascade_view_override,
                     extract_ambient_light_resource,
                     extract_ambient_light,
                     extract_shadow_filtering_method,
@@ -423,6 +429,9 @@ impl Plugin for PbrPlugin {
             // `ShadowRotationCompensation` is defined in `bevy_light`, which has no `bevy_render`
             // dependency to derive `ExtractResource` against — see that type's own doc comment).
             .init_resource::<ShadowRotationCompensation>()
+            // Render-world copy of `CascadeViewOverride`, kept in sync every frame by
+            // `extract_cascade_view_override` — see that resource's own doc comment.
+            .init_resource::<RenderCascadeViewOverride>()
             .allow_ambiguous_resource::<RenderMaterialBindings>();
 
         render_app.world_mut().add_observer(add_light_view_entities);

@@ -378,6 +378,52 @@ pub fn extract_shadow_rotation_compensation(
     }
 }
 
+/// Main-world resource: lets a receiving camera view sample a directional light's shadow
+/// cascade as *fit* to a different view's frustum than its own, while still rendering/sampling
+/// everything else (its own `GlobalTransform`, its own fragment-shader reprojection) from its
+/// own true viewpoint. Keys and values are both main-world camera entities — an entry
+/// `(view, source)` means "when `view` looks up its own directional-light cascade data, use
+/// `source`'s instead."
+///
+/// Exists so a downstream crate can decouple "the camera frustum a shadow cascade is fit to"
+/// from "the camera actually being shaded" — e.g. fitting the cascade to a deliberately
+/// quantized/stable proxy camera to avoid continuous-motion shadow-map texel aliasing
+/// ("shadow swimming") on a view that must otherwise stay perfectly continuous for its own
+/// reprojection math. `source`'s own view must still be a legitimate shadow-receiving view of
+/// the light (active, `RenderLayers` intersecting the light's) — this override only changes
+/// *which* already-fit-and-rendered cascade a *different* view's fragment shader reprojects
+/// against, it does not exempt `source` from needing to actually receive the light itself.
+#[derive(Resource, Default, Clone)]
+pub struct CascadeViewOverride(pub EntityHashMap<Entity>);
+
+/// Render-world mirror of `CascadeViewOverride`, with both the key and value remapped from
+/// main-world to render-world entity ids via each entity's own `RenderEntity` component — a
+/// plain `ExtractResource` derive can't do this remapping (it would carry the main-world entity
+/// ids over unchanged, which are meaningless as render-world entity lookups), so this is
+/// extracted manually, same reasoning as `extract_shadow_rotation_compensation` just above
+/// (though here the value itself, not just its presence, needs cross-schedule translation).
+#[derive(Resource, Default, Clone)]
+pub struct RenderCascadeViewOverride(pub EntityHashMap<Entity>);
+
+/// Remaps `CascadeViewOverride`'s main-world entity keys/values into their render-world
+/// counterparts every frame, via each entity's own `RenderEntity` component (present on any
+/// entity bevy_render's sync-world machinery has extracted, camera entities included). An
+/// entry whose key or value hasn't been extracted yet (or ever) is silently dropped for that
+/// frame — the same "just don't override yet" fallback `prepare_lights` already has for an
+/// entity with no override entry at all.
+pub fn extract_cascade_view_override(
+    main_world: Extract<Res<CascadeViewOverride>>,
+    render_entities: Extract<Query<&RenderEntity>>,
+    mut render_world: ResMut<RenderCascadeViewOverride>,
+) {
+    render_world.0.clear();
+    for (&view, &source) in main_world.0.iter() {
+        if let (Ok(view), Ok(source)) = (render_entities.get(view), render_entities.get(source)) {
+            render_world.0.insert(view.id(), source.id());
+        }
+    }
+}
+
 pub fn extract_lights(
     mut commands: Commands,
     point_light_shadow_map: Extract<Res<PointLightShadowMap>>,
@@ -1051,7 +1097,10 @@ pub fn prepare_lights(
     (render_device, render_queue): (Res<RenderDevice>, Res<RenderQueue>),
     mut global_clusterable_object_meta: ResMut<GlobalClusterableObjectMeta>,
     mut light_meta: ResMut<LightMeta>,
-    shadow_rotation: Res<ShadowRotationCompensation>,
+    (shadow_rotation, cascade_view_override): (
+        Res<ShadowRotationCompensation>,
+        Res<RenderCascadeViewOverride>,
+    ),
     views: Query<
         (
             Entity,
@@ -1912,15 +1961,22 @@ pub fn prepare_lights(
                 continue;
             }
 
+            // `CascadeViewOverride`: use a *different* view's already-fit cascade/frustum data
+            // for this view's shading, if one is registered for it — see that resource's own
+            // doc comment. `entity` (unchanged) still owns its own shadow-map render pass/view
+            // entities below (`light_view_entities.entry(entity)`), so this view still gets a
+            // real, populated shadow-map texture to sample from; only which frustum that
+            // texture was *fit to* is substituted.
+            let cascade_source = cascade_view_override.0.get(&entity).copied().unwrap_or(entity);
             let cascades = light
                 .cascades
-                .get(&entity)
+                .get(&cascade_source)
                 .unwrap()
                 .iter()
                 .take(MAX_CASCADES_PER_LIGHT);
             let frusta = light
                 .frusta
-                .get(&entity)
+                .get(&cascade_source)
                 .unwrap()
                 .iter()
                 .take(MAX_CASCADES_PER_LIGHT);
