@@ -7,7 +7,7 @@ use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
     occlusion_culling::OcclusionCulling,
-    render_phase::ViewBinnedRenderPhases,
+    render_phase::{is_mesh_bind_groups_failure, ViewBinnedRenderPhases, LOG_MESH_BIND_GROUPS_ERRORS},
     render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
     renderer::{RenderContext, ViewQuery},
     view::{ExtractedView, NoIndirectDrawing, ViewDepthTexture, ViewUniformOffset},
@@ -207,7 +207,10 @@ fn run_prepass_system(
         #[cfg(feature = "trace")]
         let _opaque_prepass_span = info_span!("opaque_prepass").entered();
         if let Err(err) = opaque_prepass_phase.render(&mut render_pass, world, view_entity) {
-            error!("Error encountered while rendering the opaque prepass phase {err:?}");
+            // voldaten diagnostic gate — see `LOG_MESH_BIND_GROUPS_ERRORS`'s own doc comment.
+            if !is_mesh_bind_groups_failure(&err) || LOG_MESH_BIND_GROUPS_ERRORS.load(core::sync::atomic::Ordering::Relaxed) {
+                error!("Error encountered while rendering the opaque prepass phase {err:?}");
+            }
         }
     }
 
@@ -215,7 +218,10 @@ fn run_prepass_system(
         #[cfg(feature = "trace")]
         let _alpha_mask_prepass_span = info_span!("alpha_mask_prepass").entered();
         if let Err(err) = alpha_mask_prepass_phase.render(&mut render_pass, world, view_entity) {
-            error!("Error encountered while rendering the alpha mask prepass phase {err:?}");
+            // voldaten diagnostic gate — see `LOG_MESH_BIND_GROUPS_ERRORS`'s own doc comment.
+            if !is_mesh_bind_groups_failure(&err) || LOG_MESH_BIND_GROUPS_ERRORS.load(core::sync::atomic::Ordering::Relaxed) {
+                error!("Error encountered while rendering the alpha mask prepass phase {err:?}");
+            }
         }
     }
 
