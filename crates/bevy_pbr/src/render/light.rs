@@ -46,7 +46,7 @@ use bevy_render::mesh::allocator::MeshSlabs;
 use bevy_render::occlusion_culling::{
     OcclusionCulling, OcclusionCullingSubview, OcclusionCullingSubviewEntities,
 };
-use bevy_render::sync_world::{MainEntity, MainEntityHashMap, RenderEntity};
+use bevy_render::sync_world::{MainEntity, MainEntityHashMap, MainEntityHashSet, RenderEntity};
 use bevy_render::view::{
     RenderExtractedShadowMapVisibleEntities, RenderShadowLodOrigin, RenderShadowMapVisibleEntities,
     RenderVisibleEntities, VisibilityExtractionSystemParam,
@@ -54,6 +54,7 @@ use bevy_render::view::{
 use bevy_render::{
     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
     camera::SortedCameras,
+    extract_resource::ExtractResource,
     mesh::allocator::MeshAllocator,
     view::{NoIndirectDrawing, RetainedViewEntity},
 };
@@ -111,8 +112,10 @@ pub struct ExtractedPointLight {
 /// frame — the light itself moved, or a shadow caster in view of it moved/changed shape. The engine
 /// does not try to infer this; set it from whatever knowledge the application has. The engine
 /// *additionally* forces a re-render regardless of `dirty` whenever it cannot guarantee the cached
-/// slice is still valid: the shadow atlas was reallocated, or the set/order of shadow-casting point
-/// lights changed this frame (which would otherwise shift atlas slots).
+/// slice is still valid: this light was only just assigned its atlas slot (it started casting
+/// shadows this frame, or the atlas was reallocated, dropping every slot). A light that merely
+/// changed position in the per-frame clustered-light ordering keeps its slot and its cached slice —
+/// see [`PointLightShadowAtlasCache`].
 ///
 /// For change detection to gate extraction correctly, mutate this component only when `dirty`
 /// actually changes value (write `true`→`false` / `false`→`true`, not the same value every frame).
@@ -123,18 +126,103 @@ pub struct CachedShadowMap {
 
 /// Persistent point-light shadow depth atlas backing [`CachedShadowMap`]. Unlike the default
 /// per-frame [`TextureCache`] allocation, this texture is retained across frames so a cached (clean)
-/// light's slice keeps its previously rendered depth and need not be re-rendered. Reallocated only
-/// when its descriptor (shadow-map size or casting-light count) changes; a realloc invalidates every
-/// slice and forces a full re-render that frame. Render-world only.
+/// light's slice keeps its previously rendered depth and need not be re-rendered.
+///
+/// Each shadow-casting point light holds a **stable, permanent atlas slot**: a cube-slice index,
+/// assigned the first time that light is ever seen casting a shadow and **never reclaimed for the
+/// rest of the session** — decoupled both from the light's index in the per-frame clustered-light
+/// buffer (its `GlobalClusterableObjectMeta::entity_to_index` value, which is rebuilt and may
+/// reorder every frame) and from whatever budget/distance gate an application uses to decide which
+/// lights are *currently* worth spending render time on. Shaders find a light's slice through the
+/// slot packed into `GpuClusteredLight::flags` (see [`POINT_LIGHT_SHADOW_ATLAS_SLOT_SHIFT`]) rather
+/// than the clustered-light index, which is what makes the decoupling possible on the sampling side.
+///
+/// This matters because a light's shadow-casting *eligibility* (an application gating lights by
+/// distance, a budget of "N nearest") is expected to churn from frame to frame, routinely dropping a
+/// light out and later bringing it back. Were slots reclaimed on drop-out, a light re-entering after
+/// a long absence would have to fight over a slot with whatever else claimed it meanwhile, forcing a
+/// fresh render exactly when a batch of lights re-enter together — the scenario a rotating or
+/// panning view produces easily. Retaining every slot forever avoids this at a pure VRAM cost (an
+/// extra cube slice per light that has ever cast a shadow, whether or not it currently is) — no
+/// CPU/GPU render-time cost, since an inactive light's retained slice is simply never touched until
+/// it becomes eligible again, at which point (if genuinely nothing changed near it while inactive)
+/// its cached depth is already correct and no re-render is needed at all.
+///
+/// The texture is reallocated only when the shadow-map size changes, or when a light is seen casting
+/// a shadow for the first time and there is no room for its new permanent slot. Since slots are never
+/// freed, capacity is monotonically non-decreasing by construction (not merely a "high-water mark"
+/// policy layered on top of a shrinkable count) — ordinary eligibility churn among already-slotted
+/// lights never reallocates. A realloc drops every slot assignment (the new texture holds no valid
+/// depth), so every currently-casting light is newly assigned — and therefore re-rendered — that
+/// frame; this is unavoidable (a GPU array texture cannot be resized in place) but should be rare in
+/// practice, since a world with a fixed, load-time-known set of lights only ever grows into new
+/// capacity as it discovers lights it has never seen casting before — see the project-side
+/// `force_shadow_refresh_on_world_load`-style warm-up this is meant to be paired with, which pays
+/// this cost for every light once at world-load time instead of piecemeal during gameplay.
+///
+/// **Known limitation, deliberately deferred: VRAM scales with total distinct lights ever seen
+/// casting, not with how many are ever simultaneously active.** For a scene whose active-light
+/// budget is small relative to its total light count (a large level with many more lights scattered
+/// around than can ever be near the camera at once), this atlas keeps a permanent cube slice for
+/// every one of them for the rest of the session, even lights that will only ever be active for a
+/// moment near the very start. A future optimization, not implemented here: stage an inactive
+/// light's depth slice out to system RAM (or simply drop it, keeping only "this was correct as of
+/// frame N" bookkeeping and accepting a one-time re-render on return) once it has been out of the
+/// active set for some threshold, and stage it back into a VRAM slot only when the light becomes
+/// active again — trading a system-RAM/PCIe-copy cost (or an occasional deferred re-render) for
+/// bounded VRAM, worthwhile only once total-light count in a real scene grows large enough that this
+/// atlas's VRAM footprint actually matters. Not worth the complexity for a scene where the total
+/// light count and the active budget are close in magnitude, which is the common case this fix was
+/// built for.
+///
+/// Render-world only.
 #[derive(Resource, Default)]
 pub struct PointLightShadowAtlasCache {
     texture: Option<Texture>,
     size: u32,
-    layers: u32,
-    /// Main entities of shadow-casting point lights in slot order, as of last frame. If this differs
-    /// this frame, slot assignments shifted, so every slice is re-rendered regardless of `dirty`.
-    order: Vec<MainEntity>,
+    /// Number of cube slices the allocated texture currently has room for. Deliberately **not**
+    /// just `slots.len()` — it's grown with headroom (`next_power_of_two` of what was needed at the
+    /// last reallocation, see `prepare_lights`), specifically so that discovering one more
+    /// previously-unseen light doesn't by itself force a reallocation. A reallocation wipes every
+    /// existing slot assignment (the new texture holds no valid depth for any of them), so sizing
+    /// this to the exact minimum every time would mean each individually-discovered new light forces
+    /// every *other* already-slotted light to re-render too — see `prepare_lights`'s own comment at
+    /// its realloc site for why this matters.
+    capacity: u32,
+    /// Permanent per-light cube slice, assigned once (the first frame a light is ever a
+    /// shadow-casting candidate) and never removed for the rest of the session — see the type-level
+    /// docs for why. A slot is a cube-slice index in `0..capacity`; the slice's first array layer is
+    /// `slot * 6`.
+    slots: MainEntityHashMap<usize>,
 }
+
+/// Reserves point-light shadow atlas capacity **before** any light has ever cast a shadow — set
+/// this (main-world, mirrored into the render world by `ExtractResourcePlugin`) to however many
+/// point lights an application expects to need shadow slots for, if it knows that number up front
+/// from something more reliable than watching which lights have been spawned so far. `0` (the
+/// default) means "no reservation" — capacity then grows purely reactively, lazily, the first time
+/// each light is actually discovered casting a shadow.
+///
+/// **Why this matters, concretely.** `PointLightShadowAtlasCache`'s capacity grows with headroom
+/// (`next_power_of_two`, see that type's docs) specifically so one newly-discovered light doesn't
+/// force a full reallocation (and therefore a full re-render of every *other* already-slotted
+/// light) by itself. But headroom only helps once the atlas already has *some* capacity — the very
+/// first time capacity needs to grow at all (or any time a genuinely new batch of lights crosses
+/// the current headroom), that reallocation still happens, wiping every existing slot. An
+/// application that pre-warms every light it can find at world-load time (to pay this cost once,
+/// during a loading screen, rather than piecemeal during gameplay) can still be undercut if its own
+/// "have I found every light yet" signal races scene instantiation and misses some — a light
+/// discovered later, mid-gameplay, then triggers exactly the reallocation-and-mass-re-render this
+/// whole mechanism exists to avoid, just once instead of every frame.
+///
+/// Setting this resource to the *true* total up front — read from something that isn't subject to
+/// that scene-instantiation race, such as a source asset's own light list rather than counting
+/// currently-spawned ECS entities — closes that gap: `prepare_lights` folds it into the capacity
+/// decision as a floor, so the very first light discovered forces one allocation already sized for
+/// every light that will ever need a slot, and no further reallocation is needed for the rest of
+/// the session no matter which frame each individual light happens to be discovered on.
+#[derive(Default, Resource, Clone, Debug, ExtractResource)]
+pub struct PointLightShadowAtlasReservedCapacity(pub u32);
 
 #[derive(Component, Debug)]
 pub struct ExtractedRectLight {
@@ -169,6 +257,24 @@ pub struct ExtractedDirectionalLight {
     pub sun_disk_angular_size: f32,
     pub sun_disk_intensity: f32,
 }
+
+/// The upper half of `GpuClusteredLight::flags` carries a point light's shadow atlas slot rather
+/// than any flag bit: `flags >> POINT_LIGHT_SHADOW_ATLAS_SLOT_SHIFT` is the slot (see
+/// [`PointLightShadowAtlasCache`]).
+///
+/// It rides along in the spare flag bits because `GpuClusteredLight` is sized to exactly fill a
+/// WebGL 2 UBO at `MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS` entries — a `const` assertion in
+/// `cluster::mod` enforces that — so the struct has no room for another word, and `Vec4` alignment
+/// would make a new `u32` field cost a full 16 bytes per light anyway.
+///
+/// NOTE: must match `POINT_LIGHT_SHADOW_ATLAS_SLOT_SHIFT` / `_NONE` and
+/// `point_light_shadow_atlas_slot()` in bevy_pbr/src/render/mesh_view_types.wgsl!
+const POINT_LIGHT_SHADOW_ATLAS_SLOT_SHIFT: u32 = 16;
+
+/// Slot-field value for a light holding no atlas slot: spot lights (whose shadows live in the
+/// directional atlas) and point lights not casting shadows this frame. Never read by a shader, since
+/// every sample site is gated on `POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT`.
+const POINT_LIGHT_SHADOW_ATLAS_SLOT_NONE: u32 = 0xFFFF;
 
 // NOTE: These must match the bit flags in bevy_pbr/src/render/mesh_view_types.wgsl!
 bitflags::bitflags! {
@@ -1155,10 +1261,11 @@ pub fn prepare_lights(
         Query<&mut DirectionalLightViewEntities>,
     ),
     sorted_cameras: Res<SortedCameras>,
-    (gpu_preprocessing_support, decals, mut point_light_shadow_atlas): (
+    (gpu_preprocessing_support, decals, mut point_light_shadow_atlas, point_light_shadow_atlas_reserved_capacity): (
         Res<GpuPreprocessingSupport>,
         Option<Res<RenderClusteredDecals>>,
         ResMut<PointLightShadowAtlasCache>,
+        Res<PointLightShadowAtlasReservedCapacity>,
     ),
     (existing_shadow_views, mut light_key_cache, mut specialized_shadow_material_pipeline_cache): (
         Query<&ShadowView>,
@@ -1329,6 +1436,82 @@ pub fn prepare_lights(
         (light.volumetric, light.shadow_maps_enabled, *entity)
     });
 
+    // Assign each shadow-casting point light its stable atlas slot for this frame (see
+    // `PointLightShadowAtlasCache`). This happens here, before the clustered-light buffer is
+    // written, for two reasons: each light publishes its slot to the shaders through its
+    // `GpuClusteredLight::flags` in that very loop, and the atlas texture allocated further down
+    // sizes itself from the resulting capacity.
+    //
+    // Only *membership* matters here, never order — a light keeps its slot wherever it lands in the
+    // per-frame clustered-light ordering.
+    let desired_shadow_casters: Vec<MainEntity> = point_light_entities
+        .iter()
+        .take(point_light_count.min(max_texture_cubes))
+        .filter_map(|entity| {
+            let light = point_lights.get(*entity).unwrap();
+            (light.2.shadow_maps_enabled && light.2.spot_light_angles.is_none())
+                .then_some(*light.1)
+        })
+        .collect();
+    debug_assert!(desired_shadow_casters.len() <= point_light_shadow_maps_count);
+
+    let point_light_atlas_size = point_light_shadow_map.size as u32;
+    // How many *new* permanent slots this frame's casters need, beyond what's already assigned.
+    // Slots are never freed (see `PointLightShadowAtlasCache`'s docs), so this is the only way
+    // more slots are ever required.
+    let new_slots_needed = desired_shadow_casters
+        .iter()
+        .filter(|main_entity| !point_light_shadow_atlas.slots.contains_key(*main_entity))
+        .count();
+    // Folding in the reservation here (rather than only at the point the texture is first
+    // created) means it keeps applying every frame until the atlas has actually grown to cover
+    // it — so even if the reserved value only becomes available a frame or two after the very
+    // first light is discovered, the next `prepare_lights` run still catches it up in one step,
+    // rather than needing every future discovery to just happen to fit under an
+    // already-decided, too-small headroom. See `PointLightShadowAtlasReservedCapacity`'s own doc
+    // comment for why an application would set this at all.
+    let required_slots = (point_light_shadow_atlas.slots.len() + new_slots_needed)
+        .max(point_light_shadow_atlas_reserved_capacity.0 as usize) as u32;
+    let realloc_point_light_atlas = point_light_shadow_atlas.texture.is_none()
+        || point_light_shadow_atlas.size != point_light_atlas_size
+        || required_slots > point_light_shadow_atlas.capacity;
+    if realloc_point_light_atlas {
+        // A fresh texture holds no valid depth anywhere, so every existing slot assignment is void
+        // (its slice would otherwise point at now-undefined memory in the new texture). Clearing
+        // them here makes every caster `newly_slotted` below, which is exactly the "re-render
+        // everything into the new atlas this frame" behaviour a realloc requires — no separate
+        // force-all flag needed.
+        //
+        // Grown with headroom (`next_power_of_two`, not the exact `required_slots` minimum) —
+        // load-bearing, not cosmetic. Sizing to the exact requirement would mean *every single*
+        // previously-unseen light discovered from here on forces this branch again, each time
+        // wiping and force-rendering every *other* already-slotted light too — turning one light's
+        // unavoidable first-ever render into a mass re-render of everything, every time. A scene's
+        // lights are not guaranteed to all be discovered in the same frame (see the project-side
+        // load-time warm-up this is paired with, and its own doc comment on why it can't
+        // categorically guarantee catching every light in one frame either), so this headroom is
+        // what keeps a straggler harmless. With power-of-two headroom, only a light count crossing
+        // the next power-of-two boundary reallocates; any number of individually-discovered lights
+        // short of that just take an unused slot with no realloc, no wipe, and no effect on any
+        // other light's cached shadow.
+        point_light_shadow_atlas.slots.clear();
+        point_light_shadow_atlas.capacity = required_slots.next_power_of_two();
+    }
+    let point_light_atlas_capacity = point_light_shadow_atlas.capacity;
+
+    let mut newly_slotted_point_lights = MainEntityHashSet::default();
+    for main_entity in &desired_shadow_casters {
+        if point_light_shadow_atlas.slots.contains_key(main_entity) {
+            // Already has a permanent slot, and its slice is still valid: leave it untouched.
+            continue;
+        }
+        // Bump-allocate: never reused, so the next free index is simply the current count.
+        let slot = point_light_shadow_atlas.slots.len();
+        debug_assert!((slot as u32) < point_light_atlas_capacity);
+        point_light_shadow_atlas.slots.insert(*main_entity, slot);
+        newly_slotted_point_lights.insert(*main_entity);
+    }
+
     if global_clusterable_object_meta.entity_to_index.capacity() < point_light_entities.len() {
         global_clusterable_object_meta
             .entity_to_index
@@ -1338,7 +1521,19 @@ pub fn prepare_lights(
     global_clusterable_object_meta.gpu_clustered_lights.clear();
 
     for (index, entity) in point_light_entities.iter().enumerate() {
-        let light = point_lights.get(*entity).unwrap().2;
+        let (_, light_main_entity, light, ..) = point_lights.get(*entity).unwrap();
+
+        // This light's stable point-light shadow atlas slot, packed into the upper half of `flags`
+        // below; `_NONE` for spot lights and for point lights not casting shadows this frame.
+        let shadow_atlas_slot = point_light_shadow_atlas
+            .slots
+            .get(light_main_entity)
+            .map_or(POINT_LIGHT_SHADOW_ATLAS_SLOT_NONE, |slot| {
+                // Slots are bounded by the atlas capacity, itself bounded by the device's cube-array
+                // limit, so this is unreachable short of the slot allocator having gone wrong.
+                debug_assert!((*slot as u32) < POINT_LIGHT_SHADOW_ATLAS_SLOT_NONE);
+                *slot as u32
+            });
 
         let mut flags = PointLightFlags::NONE;
 
@@ -1418,7 +1613,10 @@ pub fn prepare_lights(
                     .xyz()
                     .extend(1.0 / (light.range * light.range)),
                 position_radius: light.transform.translation().extend(light.radius),
-                flags: flags.bits(),
+                // The light's stable atlas slot rides in the upper half of `flags`, deliberately
+                // unrelated to `index` (its clustered-light buffer position, inserted just below) —
+                // see `PointLightShadowAtlasCache`.
+                flags: flags.bits() | (shadow_atlas_slot << POINT_LIGHT_SHADOW_ATLAS_SLOT_SHIFT),
                 shadow_depth_bias: light.shadow_depth_bias,
                 shadow_normal_bias: light.shadow_normal_bias,
                 shadow_map_near_z: light.shadow_map_near_z,
@@ -1488,14 +1686,11 @@ pub fn prepare_lights(
     let mut directional_light_depth_attachments = HashMap::<u32, DepthAttachment>::default();
 
     // Persistent point-light shadow atlas (see `PointLightShadowAtlasCache` / `CachedShadowMap`):
-    // retained across frames so a cached (clean) light's slice keeps its depth. Reallocated only when
-    // the descriptor changes; a realloc clears `order`, forcing a full re-render this frame below.
-    let point_light_atlas_size = point_light_shadow_map.size as u32;
-    let point_light_atlas_layers = point_light_shadow_maps_count.max(1) as u32 * 6;
-    if point_light_shadow_atlas.texture.is_none()
-        || point_light_shadow_atlas.size != point_light_atlas_size
-        || point_light_shadow_atlas.layers != point_light_atlas_layers
-    {
+    // retained across frames so a cached (clean) light's slice keeps its depth. Whether to
+    // reallocate was decided with the slot assignment above (which also cleared every slot if so,
+    // forcing each caster to re-render into the new texture this frame).
+    let point_light_atlas_layers = point_light_atlas_capacity * 6;
+    if realloc_point_light_atlas {
         point_light_shadow_atlas.texture = Some(render_device.create_texture(&TextureDescriptor {
             size: Extent3d {
                 width: point_light_atlas_size,
@@ -1511,8 +1706,6 @@ pub fn prepare_lights(
             view_formats: &[],
         }));
         point_light_shadow_atlas.size = point_light_atlas_size;
-        point_light_shadow_atlas.layers = point_light_atlas_layers;
-        point_light_shadow_atlas.order.clear();
     }
     let point_light_depth_texture = point_light_shadow_atlas.texture.clone().unwrap();
 
@@ -1592,17 +1785,6 @@ pub fn prepare_lights(
     let mut live_views = EntityHashSet::with_capacity(views_count);
 
     // TODO: this should select lights based on relevance to the view instead of the first ones that show up in a query
-    // Detect whether the shadow-casting point-light set/order changed since last frame. Atlas slots
-    // are the sorted enumeration index, so a change means slots may now belong to different lights —
-    // force every casting light to re-render this frame (ignoring `CachedShadowMap::dirty`).
-    let point_light_casting_order: Vec<MainEntity> = point_light_entities
-        .iter()
-        .take(point_light_count.min(max_texture_cubes))
-        .map(|e| *point_lights.get(*e).unwrap().1)
-        .collect();
-    let force_all_point_shadows = point_light_casting_order != point_light_shadow_atlas.order;
-    point_light_shadow_atlas.order = point_light_casting_order;
-
     for light_entity in point_light_entities
         .iter()
         // Lights are sorted, shadow enabled lights are first
@@ -1624,15 +1806,27 @@ pub fn prepare_lights(
             continue;
         }
 
-        // Shadow-map caching: a light with a `CachedShadowMap` reporting clean (and whose slice is
-        // still valid — no atlas realloc / order change this frame) reuses its retained depth slice.
+        // Every casting light holds a slot by construction (it was in `desired_shadow_casters`, and
+        // this loop applies the identical filter) — a miss means the two fell out of step, which
+        // would silently render into or sample the wrong slice, so fail loudly instead.
+        let atlas_slot = *point_light_shadow_atlas
+            .slots
+            .get(light_main_entity)
+            .expect("shadow-casting point light has no atlas slot");
+
+        // Shadow-map caching: a light with a `CachedShadowMap` reporting clean, and whose slice is
+        // still valid (it did not just take a new slot this frame), reuses its retained depth slice.
         // We despawn its shadow-view entities (like the `!shadow_maps_enabled` branch above) so no
         // stale per-face views linger for `queue_shadows`/the shadow pass to process, and skip
         // preparing/marking-live its phases — so no per-view shadow work runs and the persistent
         // atlas slice keeps its previously rendered depth. The light still samples that slice via its
-        // stable atlas index (`light_index * 6`), computed elsewhere. Lights without the component
+        // stable slot (`atlas_slot * 6`), published to the shaders in `GpuClusteredLight::flags`.
+        // Lights without the component
         // (`shadow_cache == None`) always render — identical to stock behaviour.
-        let should_render_shadow = force_all_point_shadows
+        //
+        // Note this is per-light: another light joining or leaving the casting set does not disturb
+        // this one's slot, and so does not force it to re-render.
+        let should_render_shadow = newly_slotted_point_lights.contains(light_main_entity)
             || match light.shadow_cache {
                 None => true,
                 Some(dirty) => dirty,
@@ -1652,7 +1846,7 @@ pub fn prepare_lights(
             create_point_shadow_maps(
                 &mut commands,
                 &mut point_light_depth_attachments,
-                &global_clusterable_object_meta,
+                atlas_slot,
                 (
                     &cube_face_rotations,
                     point_light_frusta,
@@ -1665,13 +1859,15 @@ pub fn prepare_lights(
             );
 
             point_and_spot_light_view_entities.0 = light_view_entities;
-        } else if force_all_point_shadows || changed_point_lights.get(*light_entity).is_ok() {
-            // Update the point shadow maps with the changes (or unconditionally when a slot-order
-            // change forced a re-render, since the existing views may reference a now-stale slot).
+        } else if newly_slotted_point_lights.contains(light_main_entity)
+            || changed_point_lights.get(*light_entity).is_ok()
+        {
+            // Update the point shadow maps with the changes (or unconditionally when this light was
+            // newly slotted, since its existing views still reference its previous slot).
             create_point_shadow_maps(
                 &mut commands,
                 &mut point_light_depth_attachments,
-                &global_clusterable_object_meta,
+                atlas_slot,
                 (
                     &cube_face_rotations,
                     point_light_frusta,
@@ -2176,7 +2372,11 @@ pub fn prepare_lights(
 fn create_point_shadow_maps(
     commands: &mut Commands,
     point_light_depth_attachments: &mut HashMap<u32, DepthAttachment>,
-    global_clusterable_object_meta: &ResMut<GlobalClusterableObjectMeta>,
+    // This light's stable cube slice in the point-light shadow atlas, from
+    // `PointLightShadowAtlasCache`. Passed in rather than derived from the light's clustered-light
+    // buffer index, which is a per-frame position and would move the render destination out from
+    // under retained slices; see that type's docs.
+    atlas_slot: usize,
     (cube_face_rotations, point_light_frusta, light_view_entities): (
         &Vec<Transform>,
         Option<&CubemapFrusta>,
@@ -2187,10 +2387,6 @@ fn create_point_shadow_maps(
     point_light_shadow_map_size: u32,
     gpu_preprocessing_support_max_supported_mode: GpuPreprocessingMode,
 ) {
-    let light_index = *global_clusterable_object_meta
-        .entity_to_index
-        .get(light_entity)
-        .unwrap();
     // ignore scale because we don't want to effectively scale light radius and range
     // by applying those as a view transform to shadow map rendering of objects
     // and ignore rotation because we want the shadow map projections to align with the axes
@@ -2208,7 +2404,7 @@ fn create_point_shadow_maps(
         .zip(light_view_entities.iter().copied())
         .enumerate()
     {
-        let base_array_layer = (light_index * 6 + face_index) as u32;
+        let base_array_layer = (atlas_slot * 6 + face_index) as u32;
 
         let depth_attachment = point_light_depth_attachments
             .entry(base_array_layer)
@@ -2241,7 +2437,7 @@ fn create_point_shadow_maps(
                 depth_attachment,
                 pass_name: format!(
                     "shadow_point_light_{}_{}",
-                    light_index,
+                    atlas_slot,
                     face_index_to_name(face_index)
                 ),
             },

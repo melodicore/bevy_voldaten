@@ -214,6 +214,11 @@ impl Plugin for PbrPlugin {
 
         app.register_asset_reflect::<StandardMaterial>()
             .init_resource::<DefaultOpaqueRendererMethod>()
+            // See `PointLightShadowAtlasReservedCapacity`'s own doc comment (`render/light.rs`) —
+            // an application sets this once it knows the true total point-light count, before any
+            // light has cast a shadow, so `PointLightShadowAtlasCache`'s first-ever allocation is
+            // already sized for everyone.
+            .init_resource::<PointLightShadowAtlasReservedCapacity>()
             // Main-world side of the cascade-fit-view override — see `CascadeViewOverride`'s own
             // doc comment (`render/light.rs`). A plain resource, not `ExtractResource` (needs
             // entity remapping on extraction, which a derive can't do) — mirrored into the
@@ -258,6 +263,7 @@ impl Plugin for PbrPlugin {
                 ScatteringMediumPlugin,
                 AtmospherePlugin,
                 GpuClusteringPlugin,
+                ExtractResourcePlugin::<PointLightShadowAtlasReservedCapacity>::default(),
             ));
 
         #[cfg(feature = "bevy_gltf")]

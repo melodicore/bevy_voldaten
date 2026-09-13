@@ -26,6 +26,7 @@
 #import bevy_pbr::mesh_view_types::{
     DIRECTIONAL_LIGHT_FLAGS_VOLUMETRIC_BIT,
     POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
+    point_light_shadow_atlas_slot,
     POINT_LIGHT_FLAGS_VOLUMETRIC_BIT,
     POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
 }
@@ -470,7 +471,14 @@ fn fetch_point_shadow_without_normal(light_id: u32, frag_position: vec4<f32>, fr
     // Do the lookup, using HW PCF and comparison. Cubemaps assume a left-handed coordinate space,
     // so we have to flip the z-axis when sampling.
     let flip_z = vec3(1.0, 1.0, -1.0);
-    return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, light_id, frag_coord_xy);
+    // The atlas slot, not `light_id` — see `point_light_shadow_atlas_slot`.
+    return sample_shadow_cubemap(
+        frag_ls * flip_z,
+        distance_to_light,
+        depth,
+        point_light_shadow_atlas_slot((*light).flags),
+        frag_coord_xy,
+    );
 }
 
 fn fetch_spot_shadow_without_normal(light_id: u32, frag_position: vec4<f32>, frag_coord_xy: vec2<f32>) -> f32 {

@@ -24,6 +24,26 @@ const POINT_LIGHT_FLAGS_AFFECTS_LIGHTMAPPED_MESH_DIFFUSE_BIT: u32   = 1u << 3u;
 const POINT_LIGHT_FLAGS_CONTACT_SHADOWS_ENABLED_BIT: u32            = 1u << 4u;
 const POINT_LIGHT_FLAGS_SPOT_LIGHT_BIT: u32                         = 1u << 5u;
 
+// The upper half of `ClusteredLight::flags` carries a point light's shadow atlas slot rather than
+// any flag bit. It rides along in the spare bits because `ClusteredLight` is sized to exactly fill
+// a WebGL 2 UBO at `MAX_UNIFORM_BUFFER_CLUSTERABLE_OBJECTS` entries, so it has no room for another
+// word (and `vec4` alignment means a new `u32` field would cost a full 16 bytes).
+const POINT_LIGHT_SHADOW_ATLAS_SLOT_SHIFT: u32 = 16u;
+// Value of the slot field for a light holding no atlas slot: spot lights (whose shadows live in the
+// directional atlas) and point lights not casting shadows this frame.
+const POINT_LIGHT_SHADOW_ATLAS_SLOT_NONE: u32 = 0xFFFFu;
+
+// The cube slice this point light's shadow map occupies in the point-light shadow atlas; its first
+// face is array layer `slot * 6`.
+//
+// Deliberately *not* the light's index in `clustered_lights.data`, which is rebuilt — and may be
+// reordered — every frame. The slot is stable for as long as the light keeps casting shadows, which
+// is what lets a retained (cached) shadow map stay valid across a reordering. See the Rust-side
+// `PointLightShadowAtlasCache`.
+fn point_light_shadow_atlas_slot(flags: u32) -> u32 {
+    return flags >> POINT_LIGHT_SHADOW_ATLAS_SLOT_SHIFT;
+}
+
 struct DirectionalCascade {
     clip_from_world: mat4x4<f32>,
     texel_size: f32,

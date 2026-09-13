@@ -1,7 +1,7 @@
 #define_import_path bevy_pbr::shadows
 
 #import bevy_pbr::{
-    mesh_view_types::POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
+    mesh_view_types::{POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE, point_light_shadow_atlas_slot},
     mesh_view_bindings as view_bindings,
     shadow_sampling::{
         SPOT_SHADOW_TEXEL_SIZE, sample_shadow_cubemap, sample_shadow_cubemap_pcss,
@@ -67,7 +67,8 @@ fn fetch_point_shadow(
             frag_ls_local * flip_z,
             distance_to_light,
             depth,
-            light_id,
+            // The atlas slot, not `light_id` — see `point_light_shadow_atlas_slot`.
+            point_light_shadow_atlas_slot((*light).flags),
             (*light).soft_shadow_size,
             frag_coord_xy,
         );
@@ -75,7 +76,14 @@ fn fetch_point_shadow(
 
     // Do the lookup, using HW PCF and comparison. Cubemaps assume a left-handed
     // coordinate space, so we have to flip the z-axis when sampling.
-    return sample_shadow_cubemap(frag_ls_local * flip_z, distance_to_light, depth, light_id, frag_coord_xy);
+    // The atlas slot, not `light_id` — see `point_light_shadow_atlas_slot`.
+    return sample_shadow_cubemap(
+        frag_ls_local * flip_z,
+        distance_to_light,
+        depth,
+        point_light_shadow_atlas_slot((*light).flags),
+        frag_coord_xy,
+    );
 }
 
 fn fetch_spot_shadow(
