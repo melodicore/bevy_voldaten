@@ -162,14 +162,26 @@ impl Plugin for EnvironmentMapGenerationPlugin {
 
 /// Initializes all render-world resources used by the environment-map generator once on
 /// [`bevy_render::RenderStartup`].
+///
+/// `downsample_shaders` is `Option<Res<_>>`, not `Res<_>` — `DownsampleShaders` is inserted by
+/// `bevy_core_pipeline::mip_generation::MipGenerationPlugin`, which is otherwise only needed by
+/// GPU-driven occlusion culling and meshlets (see `CorePipelinePlugin::enable_mip_generation`'s
+/// own doc comment). Without it, this system's whole job — building the pipelines/layouts a
+/// light probe's *generated* environment map would need — has nothing to do, since there is no
+/// generated environment map possible without that plugin's shaders; skip cleanly rather than
+/// panicking on a missing resource that a project with no such light probe never needed anyway.
 pub fn initialize_generated_environment_map_resources(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     render_adapter: Res<RenderAdapter>,
     pipeline_cache: Res<PipelineCache>,
     asset_server: Res<AssetServer>,
-    downsample_shaders: Res<DownsampleShaders>,
+    downsample_shaders: Option<Res<DownsampleShaders>>,
 ) {
+    let Some(downsample_shaders) = downsample_shaders else {
+        return;
+    };
+
     // Combine the bind group and use read-write storage if it is supported
     let combine_bind_group =
         mip_generation::can_combine_downsampling_bind_groups(&render_adapter, &render_device);
@@ -556,18 +568,32 @@ pub struct GeneratorBindGroups {
 }
 
 /// Prepares bind groups for environment map generation pipelines
+///
+/// `layouts`/`samplers`/`config` are `Option<Res<_>>`, not `Res<_>` — all three, like
+/// `GeneratorPipelines` elsewhere in this file (see `downsampling_system`/`filtering_system`'s
+/// own identical `Option<Res<_>>` + early-return idiom, mirrored here), are only ever inserted
+/// by `initialize_generated_environment_map_resources`, which itself now skips doing so when
+/// `MipGenerationPlugin`'s `DownsampleShaders` isn't present (see that function's own doc
+/// comment). Without this, `light_probes` being an always-valid (if empty) `Query` wasn't enough
+/// to make this system a safe no-op with zero light probes present — the three bare `Res<_>`
+/// params above still panicked at fetch time before the (harmlessly empty) query was ever
+/// reached.
 pub fn prepare_generated_environment_map_bind_groups(
     light_probes: Query<(Entity, &IntermediateTextures, &RenderEnvironmentMap)>,
     render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
     queue: Res<RenderQueue>,
-    layouts: Res<GeneratorBindGroupLayouts>,
-    samplers: Res<GeneratorSamplers>,
+    layouts: Option<Res<GeneratorBindGroupLayouts>>,
+    samplers: Option<Res<GeneratorSamplers>>,
     render_images: Res<RenderAssets<GpuImage>>,
     bluenoise: Res<Bluenoise>,
-    config: Res<DownsamplingConfig>,
+    config: Option<Res<DownsamplingConfig>>,
     mut commands: Commands,
 ) {
+    let (Some(layouts), Some(samplers), Some(config)) = (layouts, samplers, config) else {
+        return;
+    };
+
     // Skip until the blue-noise texture is available to avoid panicking.
     // The system will retry next frame once the asset has loaded.
     let Some(stbn_texture) = render_images.get(&bluenoise.texture) else {

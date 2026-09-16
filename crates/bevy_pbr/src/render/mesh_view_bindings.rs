@@ -673,10 +673,20 @@ pub fn prepare_mesh_view_bind_groups(
     tonemapping_luts: Res<TonemappingLuts>,
     light_probes_buffer: Res<LightProbesBuffer>,
     visibility_ranges: Res<RenderVisibilityRanges>,
+    // `ssr_buffer`/`oit_buffers` are `Option<Res<_>>`, not `Res<_>` — `ScreenSpaceReflectionsPlugin`/
+    // `OrderIndependentTransparencyPlugin` are the sole inserters of these two resources
+    // (see `PbrPlugin::enable_screen_space_reflections`/`CorePipelinePlugin::enable_oit`'s own
+    // doc comments), and disabling either used to panic here on a bare `Res<_>` fetch even
+    // though the per-view branches below that actually *use* them are already correctly gated
+    // on a per-view optional component (`ViewScreenSpaceReflectionsUniformOffset`/
+    // `OrderIndependentTransparencySettingsOffset`) that's never present without the plugin —
+    // mirrors the existing `atmosphere_buffer`/`atmosphere_sampler` `Option<Res<_>>` pattern a
+    // few fields below. `contact_shadows_buffer` stays a bare `Res<_>` — `ContactShadowsPlugin`
+    // has no toggle and is always registered.
     (ssr_buffer, contact_shadows_buffer, oit_buffers): (
-        Res<ScreenSpaceReflectionsBuffer>,
+        Option<Res<ScreenSpaceReflectionsBuffer>>,
         Res<ContactShadowsBuffer>,
-        Res<OitBuffers>,
+        Option<Res<OitBuffers>>,
     ),
     (
         decals_buffer,
@@ -799,7 +809,9 @@ pub fn prepare_mesh_view_bind_groups(
                     entries.extend_with_indices(((13, fog_meta.gpu_fogs.binding().unwrap()),));
             }
 
-            if let Some(view_ssr_offset) = view_ssr_offset {
+            if let Some(view_ssr_offset) = view_ssr_offset
+                && let Some(ssr_buffer) = ssr_buffer.as_ref()
+            {
                 layout_key |= MeshPipelineViewLayoutKey::SCREEN_SPACE_REFLECTIONS;
                 offsets.push(**view_ssr_offset);
                 entries = entries.extend_with_indices(((15, ssr_buffer.binding().unwrap()),));
@@ -812,7 +824,9 @@ pub fn prepare_mesh_view_bind_groups(
                     .extend_with_indices(((16, contact_shadows_buffer.0.binding().unwrap()),));
             }
 
-            if let Some(view_oit_settings_offset) = view_oit_settings_offset {
+            if let Some(view_oit_settings_offset) = view_oit_settings_offset
+                && let Some(oit_buffers) = oit_buffers.as_ref()
+            {
                 layout_key |= MeshPipelineViewLayoutKey::OIT_ENABLED;
                 offsets.push(view_oit_settings_offset.offset);
                 entries = entries.extend_with_indices((

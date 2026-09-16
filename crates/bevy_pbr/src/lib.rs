@@ -147,6 +147,46 @@ pub struct PbrPlugin {
     pub debug_flags: RenderDebugFlags,
     /// Builds and inserts `StandardMaterial` when loading glTF files
     pub gltf_enable_standard_materials: bool,
+    /// Controls if [`VolumetricFogPlugin`] (and its `Core3d` node) is added. Purely opt-in via
+    /// the per-camera [`VolumetricFog`](bevy_light::VolumetricFog) component — a project that
+    /// never inserts it can disable this to skip the node's per-view executor hand-off.
+    pub enable_volumetric_fog: bool,
+    /// Controls if [`ScreenSpaceReflectionsPlugin`] (and its `Core3d` node) is added. Purely
+    /// opt-in via the per-camera `ScreenSpaceReflections` component.
+    ///
+    /// **History, for anyone re-touching this:** first found to be an unsafe disable, confirmed
+    /// by testing — unlike volumetric fog and atmosphere,
+    /// `bevy_pbr::render::mesh_view_bindings::prepare_mesh_view_bind_groups` (a core system that
+    /// runs for every mesh, not just a camera carrying the `ScreenSpaceReflections` component)
+    /// unconditionally read `Res<ScreenSpaceReflectionsBuffer>`, which only this plugin
+    /// initializes — panicking at runtime ("Resource does not exist") the first time any mesh
+    /// was rendered, regardless of whether SSR was actually used anywhere. **Fixed**: that
+    /// param is now `Option<Res<_>>`, and its per-view usage (already correctly gated behind the
+    /// view's own optional `ViewScreenSpaceReflectionsUniformOffset` component, which is never
+    /// present without this plugin) additionally checks the buffer is `Some` before touching it
+    /// — mirrors the pre-existing `atmosphere_buffer`/`atmosphere_sampler` `Option<Res<_>>`
+    /// pattern in that same function.
+    pub enable_screen_space_reflections: bool,
+    /// Controls if [`AtmospherePlugin`] (and [`ScatteringMediumPlugin`], its sole dependent) are
+    /// added. Purely opt-in via the per-camera `Atmosphere` component.
+    ///
+    /// **History, for anyone re-touching this:** this was first found to be a *shader*-level
+    /// hazard, not a Rust resource one, unlike `enable_screen_space_reflections`/`enable_oit`
+    /// below — `mesh_view_bindings.wgsl` (a shared library `#import`ed by essentially every PBR
+    /// shader) had an **unconditional** `#import bevy_pbr::atmosphere::types as atmosphere_types`
+    /// at the top of the file, while the import's only *usage* further down was already guarded
+    /// by `#ifdef ATMOSPHERE`. Disabling this plugin without the import itself also being
+    /// conditional broke every PBR pipeline's compile, confirmed by testing (every mesh in the
+    /// game failed to render, only UI text visible, plus a continuous flood of failed/retried
+    /// pipeline-compile log lines). **Fixed**: the import in `mesh_view_bindings.wgsl` is now
+    /// itself inside `#ifdef ATMOSPHERE` (mirroring the `OIT_ENABLED`-gated import a few lines
+    /// above it in the same file, and `pbr.wgsl`'s `OIT_ENABLED`-gated `oit_draw` import — an
+    /// established pattern in this codebase, not a novel workaround), and `PbrPlugin::build`
+    /// unconditionally calls `atmosphere::load_atmosphere_types_shader` regardless of this field
+    /// (see that function's own doc comment for why — belt-and-braces so the module path stays
+    /// registered even though `ATMOSPHERE` can now never be set with this field `false`, making
+    /// the import itself unreachable at that point anyway).
+    pub enable_atmosphere: bool,
 }
 
 impl Default for PbrPlugin {
@@ -157,6 +197,9 @@ impl Default for PbrPlugin {
             use_gpu_instance_buffer_builder: true,
             debug_flags: RenderDebugFlags::default(),
             gltf_enable_standard_materials: true,
+            enable_volumetric_fog: true,
+            enable_screen_space_reflections: true,
+            enable_atmosphere: true,
         }
     }
 }
@@ -212,6 +255,10 @@ impl Plugin for PbrPlugin {
         // Setup dummy shaders for when MeshletPlugin is not used to prevent shader import errors.
         load_shader_library!(app, "meshlet/dummy_visibility_buffer_resolve.wgsl");
 
+        // Always loaded regardless of `self.enable_atmosphere` — see
+        // `atmosphere::load_atmosphere_types_shader`'s own doc comment.
+        load_atmosphere_types_shader(app);
+
         app.register_asset_reflect::<StandardMaterial>()
             .init_resource::<DefaultOpaqueRendererMethod>()
             // See `PointLightShadowAtlasReservedCapacity`'s own doc comment (`render/light.rs`) —
@@ -245,8 +292,6 @@ impl Plugin for PbrPlugin {
                 GpuMeshPreprocessPlugin {
                     use_gpu_instance_buffer_builder: self.use_gpu_instance_buffer_builder,
                 },
-                VolumetricFogPlugin,
-                ScreenSpaceReflectionsPlugin,
                 ScreenSpaceTransmissionPlugin,
                 ClusteredDecalPlugin,
                 ContactShadowsPlugin,
@@ -260,11 +305,19 @@ impl Plugin for PbrPlugin {
                 SyncComponentPlugin::<AmbientLight, Self>::default(),
             ))
             .add_plugins((
-                ScatteringMediumPlugin,
-                AtmospherePlugin,
                 GpuClusteringPlugin,
                 ExtractResourcePlugin::<PointLightShadowAtlasReservedCapacity>::default(),
             ));
+
+        if self.enable_volumetric_fog {
+            app.add_plugins(VolumetricFogPlugin);
+        }
+        if self.enable_screen_space_reflections {
+            app.add_plugins(ScreenSpaceReflectionsPlugin);
+        }
+        if self.enable_atmosphere {
+            app.add_plugins((ScatteringMediumPlugin, AtmospherePlugin));
+        }
 
         #[cfg(feature = "bevy_gltf")]
         if self.gltf_enable_standard_materials {

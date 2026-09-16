@@ -1,7 +1,9 @@
 #define_import_path bevy_pbr::mesh_view_bindings
 
 #import bevy_pbr::mesh_view_types as types
+#ifdef ATMOSPHERE
 #import bevy_pbr::atmosphere::types as atmosphere_types
+#endif // ATMOSPHERE
 #import bevy_render::{
     view::View,
     globals::Globals,

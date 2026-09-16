@@ -92,6 +92,23 @@ use self::resources::{
     AtmosphereLutPipelines, AtmosphereSampler,
 };
 
+/// Loads just the `bevy_pbr::atmosphere::types` shader library, independent of the rest of
+/// [`AtmospherePlugin`]. `bevy_pbr::render::mesh_view_bindings` (`mesh_view_bindings.wgsl`) has
+/// an `#import bevy_pbr::atmosphere::types` — guarded by `#ifdef ATMOSPHERE` alongside its own
+/// (already-conditional) usage, so a pipeline that never sets `ATMOSPHERE` never needs this
+/// import to resolve — but naga_oil still needs the *module* registered under this path whenever
+/// the shader containing that `#ifdef` block is preprocessed for a permutation that *does* set
+/// `ATMOSPHERE`, which can't happen unless something upstream (`PbrPlugin::enable_atmosphere`)
+/// disabled the rest of this plugin while still wanting other pipelines that don't use
+/// `ATMOSPHERE` to compile cleanly. Called unconditionally from `PbrPlugin::build`, regardless
+/// of `enable_atmosphere`, so the import path always resolves; `AtmospherePlugin::build` below
+/// also calls `load_shader_library!` on this same path when it runs — redundant loads of the
+/// same embedded path are harmless (same underlying handle), so no cross-call coordination is
+/// needed either way.
+pub(crate) fn load_atmosphere_types_shader(app: &mut App) {
+    load_shader_library!(app, "types.wgsl");
+}
+
 #[doc(hidden)]
 pub struct AtmospherePlugin;
 

@@ -97,7 +97,23 @@ use crate::{
     Core3dSystems,
 };
 
-pub struct Core3dPlugin;
+pub struct Core3dPlugin {
+    /// Controls if the deferred-prepass node chain (`early_deferred_prepass`/
+    /// `late_deferred_prepass`/`copy_deferred_lighting_id`) is registered into `Core3d`. These
+    /// nodes are already gated per-view (a `ViewQuery` requiring `DeferredPrepass`) so their body
+    /// cost is near-zero for a camera that never uses deferred rendering, but every registered
+    /// node still pays a per-view executor hand-off regardless of body cost — a project with no
+    /// deferred-rendering camera at all can disable this to skip that hand-off entirely.
+    pub enable_deferred_prepass: bool,
+}
+
+impl Default for Core3dPlugin {
+    fn default() -> Self {
+        Self {
+            enable_deferred_prepass: true,
+        }
+    }
+}
 
 impl Plugin for Core3dPlugin {
     fn build(&self, app: &mut App) {
@@ -141,8 +157,10 @@ impl Plugin for Core3dPlugin {
                     prepare_prepass_textures.in_set(RenderSystems::PrepareResources),
                 ),
             )
-            .add_schedule(Core3d::base_schedule())
-            .add_systems(
+            .add_schedule(Core3d::base_schedule());
+
+        if self.enable_deferred_prepass {
+            render_app.add_systems(
                 Core3d,
                 (
                     (
@@ -161,6 +179,21 @@ impl Plugin for Core3dPlugin {
                     upscaling.after(Core3dSystems::PostProcess),
                 ),
             );
+        } else {
+            render_app.add_systems(
+                Core3d,
+                (
+                    (early_prepass, late_prepass)
+                        .chain()
+                        .in_set(Core3dSystems::Prepass),
+                    (main_opaque_pass_3d, main_transparent_pass_3d)
+                        .chain()
+                        .in_set(Core3dSystems::MainPass),
+                    tonemapping.in_set(Core3dSystems::PostProcess),
+                    upscaling.after(Core3dSystems::PostProcess),
+                ),
+            );
+        }
     }
 }
 
