@@ -1,4 +1,5 @@
 import package::render::mesh_view_types as types;
+@if(ATMOSPHERE)
 import package::atmosphere::types as atmosphere_types;
 import bevy_render::{
     view::View,
