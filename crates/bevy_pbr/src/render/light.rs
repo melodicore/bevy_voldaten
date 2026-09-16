@@ -10,7 +10,7 @@ use bevy_camera::visibility::{
 };
 use bevy_camera::{Camera, Camera3d, RenderTarget, ShadowLodOrigin};
 use bevy_color::ColorToComponents;
-use bevy_core_pipeline::schedule::RootNonCameraView;
+use bevy_core_pipeline::schedule::{RootNonCameraView, ShadowMapSchedule};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::schedule::ScheduleLabel;
 use bevy_ecs::system::SystemChangeTick;
@@ -2608,7 +2608,7 @@ fn create_point_shadow_maps(
                 face_index,
             },
             (*light_render_layers).clone(),
-            RootNonCameraView(Core3d.intern()),
+            RootNonCameraView(ShadowMapSchedule.intern()),
         ));
 
         if !matches!(
@@ -2701,7 +2701,7 @@ fn create_spot_shadow_map(
             light_entity: *light_entity,
         },
         (*light_render_layers).clone(),
-        RootNonCameraView(Core3d.intern()),
+        RootNonCameraView(ShadowMapSchedule.intern()),
     ));
 
     if !matches!(

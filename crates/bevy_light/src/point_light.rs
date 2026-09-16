@@ -6,7 +6,7 @@ use bevy_camera::{
 use bevy_color::Color;
 use bevy_ecs::prelude::*;
 use bevy_image::Image;
-use bevy_math::{proj, Mat4, Quat};
+use bevy_math::{proj, Quat};
 use bevy_reflect::prelude::*;
 use bevy_shape::ViewFrustum;
 use bevy_transform::components::{GlobalTransform, Transform};
