@@ -11,7 +11,7 @@ use bevy_camera::visibility::{
 use bevy_camera::{Camera, Camera3d, RenderTarget, ShadowLodOrigin};
 use bevy_color::ColorToComponents;
 use bevy_core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT;
-use bevy_core_pipeline::schedule::RootNonCameraView;
+use bevy_core_pipeline::schedule::{RootNonCameraView, ShadowMapSchedule};
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::schedule::ScheduleLabel;
 use bevy_ecs::{
@@ -2461,7 +2461,7 @@ fn create_point_shadow_maps(
                 light_entity: *light_entity,
                 face_index,
             },
-            RootNonCameraView(Core3d.intern()),
+            RootNonCameraView(ShadowMapSchedule.intern()),
         ));
 
         if !matches!(
@@ -2542,7 +2542,7 @@ fn create_spot_shadow_map(
         LightEntity::Spot {
             light_entity: *light_entity,
         },
-        RootNonCameraView(Core3d.intern()),
+        RootNonCameraView(ShadowMapSchedule.intern()),
     ));
 
     if !matches!(

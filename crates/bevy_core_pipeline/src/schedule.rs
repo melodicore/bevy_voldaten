@@ -108,6 +108,46 @@ impl Core2d {
     }
 }
 
+/// Schedule label for a minimal render-graph schedule used by point/spot light shadow map views
+/// (see `RootNonCameraView`, below), instead of the full `Core3d` schedule.
+///
+/// A shadow-map view never draws to `Core3dSystems::MainPass`/`PostProcess` at all — it only ever
+/// writes its own depth-only shadow map via `bevy_pbr::render::light::{per_view_shadow_pass,
+/// shared_shadow_pass}` (plus the GPU mesh-preprocessing steps those depend on) — so routing it
+/// through all 43 of `Core3d`'s node systems pays a per-view executor hand-off (measured ~5.6us
+/// per node in this project's own Tracy trace analysis, `docs/render_orchestration_handoff.md`'s
+/// Lever 2) for ~35 nodes that are pure no-ops for this view type, on top of the ~8 that matter.
+/// `camera_driver` runs whatever schedule a `RootNonCameraView` names, generically — this is a
+/// second, much smaller such schedule alongside `Core2d`/`Core3d`, not a special case in the
+/// driver itself.
+///
+/// Node set and ordering, re-derived (not copy-pasted) from `bevy_pbr`'s own registration of
+/// these systems into `Core3d`, since that registration's `.after()`/`.before()` constraints
+/// reference `Core3d`-only systems (`early_prepass`, `late_prepass`, `early_downsample_depth`,
+/// `late_deferred_prepass`) that don't exist in this schedule and so can't just be copied
+/// verbatim:
+/// - `late_prepass_build_indirect_parameters` and the `LATE_SHADOW_PASS` (`IS_LATE = true`)
+///   instantiations of `per_view_shadow_pass`/`shared_shadow_pass` are deliberately **not**
+///   registered here at all (not merely reordered) — confirmed by reading their own gating,
+///   not inferred: `late_prepass_build_indirect_parameters`'s `run_if` requires
+///   `With<OcclusionCulling>` on some entity, and `view_shadow_pass::<IS_LATE>`'s own body is
+///   `if IS_LATE && !occlusion_culling { return; }` — both are unconditional no-ops for this
+///   project, which uses no `OcclusionCulling` component anywhere. Omitting them here changes no
+///   behavior versus today's `Core3d`-routed version; it only removes hand-off for systems that
+///   already never did anything.
+/// - Every other node in the original registration (`clear_indirect_parameters_metadata`,
+///   `unpack_bins`, `early_gpu_preprocess`, `early_prepass_build_indirect_parameters`,
+///   `late_gpu_preprocess`, `main_build_indirect_parameters`, and the `EARLY_SHADOW_PASS`
+///   instantiations of `per_view_shadow_pass`/`shared_shadow_pass`) is kept, chained in one
+///   single sequential order that preserves every relative-order constraint the original
+///   registration actually established between kept nodes (see the two call sites' own comments
+///   in `bevy_pbr/src/render/gpu_preprocess.rs`/`light.rs` for exactly which). Where the original
+///   established no constraint between two kept nodes, this chain still picks *some* order
+///   (harmless — a real dependency would misbehave either way if this reasoning were wrong; an
+///   absent one is unaffected by which arbitrary order is picked).
+#[derive(ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct ShadowMapSchedule;
+
 /// Holds the entity of windows that are a render target for a camera
 #[derive(Resource)]
 struct CameraWindows(EntityHashSet);

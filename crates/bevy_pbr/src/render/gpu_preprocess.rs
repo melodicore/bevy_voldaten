@@ -18,7 +18,7 @@ use bevy_core_pipeline::{
         DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass, PreviousViewData,
         PreviousViewUniformOffset, PreviousViewUniforms,
     },
-    schedule::{Core3d, Core3dSystems},
+    schedule::{Core3d, Core3dSystems, ShadowMapSchedule},
 };
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
@@ -472,6 +472,32 @@ impl Plugin for GpuMeshPreprocessPlugin {
                         .after(late_deferred_prepass)
                         .before(Core3dSystems::MainPass),
                 ),
+            )
+            // See `ShadowMapSchedule`'s own doc comment (`bevy_core_pipeline::schedule`) for why
+            // this exists and how its node/ordering set was derived from the `Core3d`
+            // registration just above. `late_prepass_build_indirect_parameters` is deliberately
+            // omitted — its own `run_if` requires `With<OcclusionCulling>`, never present in a
+            // project with no occlusion culling, so it would never run here regardless.
+            .add_systems(
+                ShadowMapSchedule,
+                (
+                    clear_indirect_parameters_metadata,
+                    unpack_bins,
+                    early_gpu_preprocess,
+                    early_prepass_build_indirect_parameters.run_if(any_match_filter::<(
+                        With<PreprocessBindGroups>,
+                        Without<SkipGpuPreprocess>,
+                        Without<NoIndirectDrawing>,
+                        Or<(WithAnyPrepass, With<ShadowView>)>,
+                    )>),
+                    late_gpu_preprocess,
+                    main_build_indirect_parameters.run_if(any_match_filter::<(
+                        With<PreprocessBindGroups>,
+                        Without<SkipGpuPreprocess>,
+                        Without<NoIndirectDrawing>,
+                    )>),
+                )
+                    .chain(),
             );
     }
 }

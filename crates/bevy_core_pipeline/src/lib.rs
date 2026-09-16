@@ -22,7 +22,7 @@ pub mod upscaling;
 use bevy_ecs::schedule::IntoScheduleConfigs;
 pub use bevy_light::Skybox;
 pub use fullscreen_vertex_shader::FullscreenShader;
-pub use schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems};
+pub use schedule::{Core2d, Core2dSystems, Core3d, Core3dSystems, ShadowMapSchedule};
 
 mod fullscreen_vertex_shader;
 
@@ -140,5 +140,33 @@ impl Plugin for CorePipelinePlugin {
                     .in_set(RenderGraphSystems::Submit),
             ),
         );
+
+        // Registered here (rather than left to whichever of bevy_pbr's plugins happens to
+        // `add_systems(ShadowMapSchedule, ...)` first, which would auto-create it with default build
+        // settings) so it gets the same `auto_insert_apply_deferred: false` `Core2d`/`Core3d`
+        // already use — see `ShadowMapSchedule`'s own doc comment.
+        render_app.edit_schedule(ShadowMapSchedule, |schedule| {
+            use bevy_ecs::schedule::{ScheduleBuildSettings, SingleThreadedExecutor};
+            schedule.set_build_settings(ScheduleBuildSettings {
+                auto_insert_apply_deferred: false,
+                ..Default::default()
+            });
+            // Every system in this schedule is totally ordered with respect to every other one
+            // (`GpuMeshPreprocessPlugin` registers its six as one `.chain()`, and `PbrPlugin`'s
+            // `shared_shadow_pass` is pinned between two links of that chain), so there is no
+            // parallelism here for the default `MultiThreadedExecutor` to find — only its
+            // per-system task spawn/wake/join cost, which is the very overhead this schedule
+            // exists to avoid. Set unconditionally rather than left to the app: unlike
+            // `Core2d`/`Core3d`, whose node sets are open for other plugins to extend (so whether
+            // they are serial is an app-level property), this schedule's node set is fixed here,
+            // and its serial-by-construction shape is a property of the schedule itself.
+            //
+            // Without this, a downstream app that has put `Core3d` on the single-threaded
+            // executor gets a *regression* from routing shadow views here — they would move from
+            // a single-threaded schedule to a multi-threaded one, reintroducing exactly the
+            // hand-off cost the reroute was meant to remove. An app that genuinely wants the
+            // multi-threaded executor here can still override with its own `edit_schedule`.
+            schedule.set_executor(SingleThreadedExecutor::new());
+        });
     }
 }

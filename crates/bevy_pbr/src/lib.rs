@@ -109,7 +109,7 @@ use crate::{deferred::DeferredPbrLightingPlugin, gpu::extract_clusters_for_gpu_c
 use bevy_app::prelude::*;
 use bevy_asset::{AssetApp, AssetPath, Assets, Handle, RenderAssetUsages};
 use bevy_core_pipeline::mip_generation::experimental::depth::early_downsample_depth;
-use bevy_core_pipeline::schedule::{Core3d, Core3dSystems};
+use bevy_core_pipeline::schedule::{Core3d, Core3dSystems, ShadowMapSchedule};
 use bevy_ecs::prelude::*;
 use bevy_image::{Image, ImageSampler};
 use bevy_material::AlphaMode;
@@ -501,27 +501,47 @@ impl Plugin for PbrPlugin {
             .world_mut()
             .add_observer(remove_point_and_spot_light_view_entities);
 
-        render_app.add_systems(
-            Core3d,
-            (
-                per_view_shadow_pass::<EARLY_SHADOW_PASS>
-                    .after(early_prepass_build_indirect_parameters)
-                    .before(early_downsample_depth)
-                    .before(per_view_shadow_pass::<LATE_SHADOW_PASS>),
-                per_view_shadow_pass::<LATE_SHADOW_PASS>
-                    .after(late_prepass_build_indirect_parameters)
-                    .before(main_build_indirect_parameters)
-                    .before(Core3dSystems::MainPass),
+        render_app
+            .add_systems(
+                Core3d,
+                (
+                    // `shared_shadow_pass` is deliberately *not* registered here — see this
+                    // block's own `ShadowMapSchedule` registration below for why: point/spot
+                    // light shadow views (the only thing `shared_shadow_pass` ever renders,
+                    // per its own doc comment) are routed to `ShadowMapSchedule` now, not
+                    // `Core3d`, and `per_view_shadow_pass`'s `ViewQuery<&ViewLightEntities>`
+                    // never matches one of those views' own root entity anyway (that component
+                    // lives on the *camera* view listing its lights, not on a light's own
+                    // shadow-view entity) — so keeping `shared_shadow_pass` registered here too
+                    // would just be dead weight paying the per-view hand-off for a system that
+                    // can structurally never find a matching view through this schedule again.
+                    per_view_shadow_pass::<EARLY_SHADOW_PASS>
+                        .after(early_prepass_build_indirect_parameters)
+                        .before(early_downsample_depth)
+                        .before(per_view_shadow_pass::<LATE_SHADOW_PASS>),
+                    per_view_shadow_pass::<LATE_SHADOW_PASS>
+                        .after(late_prepass_build_indirect_parameters)
+                        .before(main_build_indirect_parameters)
+                        .before(Core3dSystems::MainPass),
+                ),
+            )
+            // See `ShadowMapSchedule`'s own doc comment (`bevy_core_pipeline::schedule`).
+            // `shared_shadow_pass::<LATE_SHADOW_PASS>` is omitted — its own body
+            // (`view_shadow_pass::<IS_LATE>`) is `if IS_LATE && !occlusion_culling { return; }`,
+            // an unconditional no-op without `OcclusionCulling`, confirmed by reading the source.
+            // Ordered relative to `GpuMeshPreprocessPlugin`'s own `ShadowMapSchedule` systems
+            // (registered earlier in this same `PbrPlugin::build`, via the nested
+            // `app.add_plugins(GpuMeshPreprocessPlugin { .. })` call above) rather than being
+            // part of that same `.chain()` — mirrors this exact system's own position in the
+            // `Core3d` chain just above (`.after(early_prepass_build_indirect_parameters)`,
+            // `.before(early_downsample_depth)`, i.e. between the early and late gpu-preprocess
+            // phases), not a guess.
+            .add_systems(
+                ShadowMapSchedule,
                 shared_shadow_pass::<EARLY_SHADOW_PASS>
                     .after(early_prepass_build_indirect_parameters)
-                    .before(early_downsample_depth)
-                    .before(shared_shadow_pass::<LATE_SHADOW_PASS>),
-                shared_shadow_pass::<LATE_SHADOW_PASS>
-                    .after(late_prepass_build_indirect_parameters)
-                    .before(main_build_indirect_parameters)
-                    .before(Core3dSystems::MainPass),
-            ),
-        );
+                    .before(late_gpu_preprocess),
+            );
     }
 
     fn finish(&self, app: &mut App) {
