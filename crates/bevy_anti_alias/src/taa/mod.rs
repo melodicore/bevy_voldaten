@@ -121,11 +121,23 @@ pub struct TemporalAntiAliasing {
     /// After setting this to true, it will automatically be toggled
     /// back to false at the end of the frame.
     pub reset: bool,
+
+    /// Also temporally resolve the alpha channel, treating the view target as **premultiplied**
+    /// colour (`rgb` already scaled by `a`, as a cleared-transparent target rendered with opaque
+    /// geometry, or an MSAA resolve of one, is).
+    ///
+    /// By default TAA resolves colour only and passes the current frame's alpha straight through,
+    /// which leaves silhouette edges hard (and their colour contaminated by the transparent
+    /// background) on a view whose alpha matters — e.g. one composited over other content. With this
+    /// set, alpha is reprojected, neighbourhood-clamped and blended exactly like colour, so edges
+    /// converge to their true coverage. The history's alpha channel normally stores the per-pixel
+    /// confidence counter, so this mode keeps confidence in an extra `R16Float` history texture.
+    pub resolve_alpha: bool,
 }
 
 impl Default for TemporalAntiAliasing {
     fn default() -> Self {
-        Self { reset: true }
+        Self { reset: true, resolve_alpha: false }
     }
 }
 
@@ -141,13 +153,21 @@ pub fn temporal_anti_alias(
         &ViewPrepassTextures,
         &TemporalAntiAliasPipelineId,
         &Msaa,
+        &TemporalAntiAliasing,
     )>,
     pipelines: Option<Res<TaaPipeline>>,
     pipeline_cache: Res<PipelineCache>,
     mut ctx: RenderContext,
 ) {
-    let (camera, view_target, taa_history_textures, prepass_textures, taa_pipeline_id, msaa) =
-        view.into_inner();
+    let (
+        camera,
+        view_target,
+        taa_history_textures,
+        prepass_textures,
+        taa_pipeline_id,
+        msaa,
+        taa_settings,
+    ) = view.into_inner();
 
     if *msaa != Msaa::Off {
         warn!("Temporal anti-aliasing requires MSAA to be disabled");
@@ -165,40 +185,76 @@ pub fn temporal_anti_alias(
         return;
     };
 
+    // The alpha-resolving variant carries its confidence in an extra history texture.
+    let aux = if taa_settings.resolve_alpha {
+        let Some(aux) = taa_history_textures.aux.as_ref() else {
+            return;
+        };
+        Some(aux)
+    } else {
+        None
+    };
+
     let view_target = view_target.post_process_write();
 
-    let taa_bind_group = ctx.render_device().create_bind_group(
-        "taa_bind_group",
-        &pipeline_cache.get_bind_group_layout(&pipelines.taa_bind_group_layout),
-        &BindGroupEntries::sequential((
-            view_target.source,
-            &taa_history_textures.read.default_view,
-            &prepass_motion_vectors_texture.texture.default_view,
-            &prepass_depth_texture.texture.default_view,
-            &pipelines.nearest_sampler,
-            &pipelines.linear_sampler,
-        )),
-    );
+    let taa_bind_group = if let Some(aux) = aux {
+        ctx.render_device().create_bind_group(
+            "taa_bind_group_alpha",
+            &pipeline_cache.get_bind_group_layout(&pipelines.taa_bind_group_layout_alpha),
+            &BindGroupEntries::sequential((
+                view_target.source,
+                &taa_history_textures.read.default_view,
+                &prepass_motion_vectors_texture.texture.default_view,
+                &prepass_depth_texture.texture.default_view,
+                &pipelines.nearest_sampler,
+                &pipelines.linear_sampler,
+                &aux.read.default_view,
+            )),
+        )
+    } else {
+        ctx.render_device().create_bind_group(
+            "taa_bind_group",
+            &pipeline_cache.get_bind_group_layout(&pipelines.taa_bind_group_layout),
+            &BindGroupEntries::sequential((
+                view_target.source,
+                &taa_history_textures.read.default_view,
+                &prepass_motion_vectors_texture.texture.default_view,
+                &prepass_depth_texture.texture.default_view,
+                &pipelines.nearest_sampler,
+                &pipelines.linear_sampler,
+            )),
+        )
+    };
 
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
+    let mut color_attachments = vec![
+        Some(RenderPassColorAttachment {
+            view: view_target.destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations::default(),
+        }),
+        Some(RenderPassColorAttachment {
+            view: &taa_history_textures.write.default_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations::default(),
+        }),
+    ];
+    if let Some(aux) = aux {
+        color_attachments.push(Some(RenderPassColorAttachment {
+            view: &aux.write.default_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: Operations::default(),
+        }));
+    }
+
     let mut taa_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("taa"),
-        color_attachments: &[
-            Some(RenderPassColorAttachment {
-                view: view_target.destination,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations::default(),
-            }),
-            Some(RenderPassColorAttachment {
-                view: &taa_history_textures.write.default_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: Operations::default(),
-            }),
-        ],
+        color_attachments: &color_attachments,
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
@@ -219,6 +275,7 @@ pub fn temporal_anti_alias(
 #[derive(Resource)]
 pub struct TaaPipeline {
     taa_bind_group_layout: BindGroupLayoutDescriptor,
+    taa_bind_group_layout_alpha: BindGroupLayoutDescriptor,
     nearest_sampler: Sampler,
     linear_sampler: Sampler,
     variants: Variants<RenderPipeline, TaaPipelineSpecializer>,
@@ -264,10 +321,28 @@ fn init_taa_pipeline(
         ),
     );
 
+    // Same bindings plus the confidence history (see `TemporalAntiAliasing::resolve_alpha`).
+    let taa_bind_group_layout_alpha = BindGroupLayoutDescriptor::new(
+        "taa_bind_group_layout_alpha",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_depth_2d(),
+                sampler(SamplerBindingType::NonFiltering),
+                sampler(SamplerBindingType::Filtering),
+                // Confidence history (read)
+                texture_2d(TextureSampleType::Float { filterable: true }),
+            ),
+        ),
+    );
+
     let fragment_shader = load_embedded_asset!(asset_server.as_ref(), "taa.wgsl");
 
     let variants = Variants::new(
-        TaaPipelineSpecializer,
+        TaaPipelineSpecializer { alpha_layout: taa_bind_group_layout_alpha.clone() },
         RenderPipelineDescriptor {
             label: Some("taa_pipeline".into()),
             layout: vec![taa_bind_group_layout.clone()],
@@ -282,19 +357,23 @@ fn init_taa_pipeline(
 
     commands.insert_resource(TaaPipeline {
         taa_bind_group_layout,
+        taa_bind_group_layout_alpha,
         nearest_sampler,
         linear_sampler,
         variants,
     });
 }
 
-struct TaaPipelineSpecializer;
+struct TaaPipelineSpecializer {
+    alpha_layout: BindGroupLayoutDescriptor,
+}
 
 #[derive(PartialEq, Eq, Hash, Clone, SpecializerKey)]
 struct TaaPipelineKey {
     target_format: TextureFormat,
     tonemap: bool,
     reset: bool,
+    alpha: bool,
 }
 
 impl Specializer<RenderPipeline> for TaaPipelineSpecializer {
@@ -314,6 +393,10 @@ impl Specializer<RenderPipeline> for TaaPipelineSpecializer {
             fragment.shader_defs.push("RESET".into());
         }
 
+        if key.alpha {
+            fragment.shader_defs.push("ALPHA".into());
+        }
+
         let color_target_state = ColorTargetState {
             format: key.target_format,
             blend: None,
@@ -322,6 +405,18 @@ impl Specializer<RenderPipeline> for TaaPipelineSpecializer {
 
         fragment.set_target(0, color_target_state.clone());
         fragment.set_target(1, color_target_state);
+
+        if key.alpha {
+            fragment.set_target(
+                2,
+                ColorTargetState {
+                    format: TextureFormat::R16Float,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                },
+            );
+            descriptor.layout = vec![self.alpha_layout.clone()];
+        }
 
         Ok(key)
     }
@@ -386,6 +481,13 @@ fn prepare_taa_jitter(
 pub struct TemporalAntiAliasHistoryTextures {
     write: CachedTexture,
     read: CachedTexture,
+    /// Per-pixel confidence history, only for `TemporalAntiAliasing::resolve_alpha` views.
+    aux: Option<TemporalAntiAliasAuxTextures>,
+}
+
+pub struct TemporalAntiAliasAuxTextures {
+    write: CachedTexture,
+    read: CachedTexture,
 }
 
 fn prepare_taa_history_textures(
@@ -393,9 +495,9 @@ fn prepare_taa_history_textures(
     mut texture_cache: ResMut<TextureCache>,
     render_device: Res<RenderDevice>,
     frame_count: Res<FrameCount>,
-    cameras: Query<(Entity, &ExtractedView, &ExtractedCamera), With<TemporalAntiAliasing>>,
+    cameras: Query<(Entity, &ExtractedView, &ExtractedCamera, &TemporalAntiAliasing)>,
 ) {
-    for (entity, view, camera) in &cameras {
+    for (entity, view, camera, taa_settings) in &cameras {
         if let Some(physical_target_size) = camera.physical_target_size {
             let mut texture_descriptor = TextureDescriptor {
                 label: None,
@@ -412,17 +514,30 @@ fn prepare_taa_history_textures(
             let history_1_texture = texture_cache.get(&render_device, texture_descriptor.clone());
 
             texture_descriptor.label = Some("taa_history_2_texture");
-            let history_2_texture = texture_cache.get(&render_device, texture_descriptor);
+            let history_2_texture = texture_cache.get(&render_device, texture_descriptor.clone());
+
+            let (aux_1, aux_2) = if taa_settings.resolve_alpha {
+                texture_descriptor.format = TextureFormat::R16Float;
+                texture_descriptor.label = Some("taa_confidence_1_texture");
+                let aux_1 = texture_cache.get(&render_device, texture_descriptor.clone());
+                texture_descriptor.label = Some("taa_confidence_2_texture");
+                let aux_2 = texture_cache.get(&render_device, texture_descriptor);
+                (Some(aux_1), Some(aux_2))
+            } else {
+                (None, None)
+            };
 
             let textures = if frame_count.0.is_multiple_of(2) {
                 TemporalAntiAliasHistoryTextures {
                     write: history_1_texture,
                     read: history_2_texture,
+                    aux: aux_1.zip(aux_2).map(|(write, read)| TemporalAntiAliasAuxTextures { write, read }),
                 }
             } else {
                 TemporalAntiAliasHistoryTextures {
                     write: history_2_texture,
                     read: history_1_texture,
+                    aux: aux_1.zip(aux_2).map(|(read, write)| TemporalAntiAliasAuxTextures { write, read }),
                 }
             };
 
@@ -450,6 +565,7 @@ fn prepare_taa_pipelines(
             target_format: view.target_format,
             tonemap: camera.hdr,
             reset: taa_settings.reset,
+            alpha: taa_settings.resolve_alpha,
         };
         let pipeline_id = pipeline
             .variants
