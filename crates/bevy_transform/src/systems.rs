@@ -527,7 +527,11 @@ mod parallel {
                     return;
                 }
 
-                *parent_transform = GlobalTransform::from(*transform);
+                // `set_if_neq`, like the descendants below: this runs whenever *anything* in the
+                // tree changed, so an unconditional write would mark the root's `GlobalTransform`
+                // changed every frame a single descendant animates, even though the root itself
+                // never moved.
+                parent_transform.set_if_neq(GlobalTransform::from(*transform));
 
                 // SAFETY: the parent entities passed into this function are taken from iterating
                 // over the root entity query. Queries iterate over disjoint entities, preventing
