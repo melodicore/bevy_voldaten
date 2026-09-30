@@ -12,8 +12,8 @@ use bevy_light::{
 use bevy_math::{uvec4, UVec3, UVec4, Vec4};
 use bevy_render::{
     render_resource::{
-        BindingResource, BufferBindingType, BufferUsages, DownlevelFlags, RawBufferVec, ShaderSize,
-        ShaderType, StorageBuffer, UniformBuffer,
+        BindingResource, Buffer, BufferBindingType, BufferUsages, DownlevelFlags, RawBufferVec,
+        ShaderSize, ShaderType, StorageBuffer, UniformBuffer,
     },
     renderer::{RenderAdapter, RenderDevice, RenderQueue},
     sync_world::{MainEntity, RenderEntity},
@@ -724,6 +724,94 @@ impl ViewClusterBindings {
                 self.n_indices += elements;
             }
         }
+    }
+
+    /// The number of cluster offset-and-count entries currently held.
+    pub(crate) fn n_offsets(&self) -> usize {
+        self.n_offsets
+    }
+
+    /// Whether both storage buffers have been allocated on the GPU.
+    ///
+    /// Always false for uniform-buffer bindings, which GPU clustering never
+    /// uses.
+    pub(crate) fn storage_buffers_uploaded(&self) -> bool {
+        match &self.buffers {
+            ViewClusterBuffers::Uniform { .. } => false,
+            ViewClusterBuffers::Storage {
+                clusterable_object_index_lists,
+                cluster_offsets_and_counts,
+            } => {
+                clusterable_object_index_lists.buffer().is_some()
+                    && cluster_offsets_and_counts.buffer().is_some()
+            }
+        }
+    }
+
+    /// The GPU buffer holding the per-cluster offsets and counts, if this is a
+    /// storage-buffer binding that has been uploaded.
+    pub(crate) fn offsets_and_counts_buffer(&self) -> Option<&Buffer> {
+        match &self.buffers {
+            ViewClusterBuffers::Uniform { .. } => None,
+            ViewClusterBuffers::Storage {
+                cluster_offsets_and_counts,
+                ..
+            } => cluster_offsets_and_counts.buffer(),
+        }
+    }
+
+    /// Replaces the contents with a single cluster holding every clusterable
+    /// object in `indices`, which must already be in the per-type order the
+    /// shaders expect (point lights, spot lights, reflection probes, irradiance
+    /// volumes, decals).
+    ///
+    /// Returns true if the contents differ from what was held before, i.e.
+    /// whether the GPU buffers need rewriting.
+    pub(crate) fn set_single_cluster(
+        &mut self,
+        counts: &ClusterableObjectCounts,
+        indices: &[u32],
+    ) -> bool {
+        let ViewClusterBuffers::Storage {
+            clusterable_object_index_lists,
+            cluster_offsets_and_counts,
+        } = &mut self.buffers
+        else {
+            error!("`set_single_cluster` should only be called in GPU clustering, which requires a storage buffer");
+            return false;
+        };
+
+        let offset_and_counts: GpuClusterOffsetAndCounts = [
+            uvec4(
+                0,
+                counts.point_lights,
+                counts.spot_lights,
+                counts.reflection_probes,
+            ),
+            uvec4(counts.irradiance_volumes, counts.decals, 0, 0),
+        ];
+        // A runtime-sized storage array must hold at least one element, so an
+        // empty list keeps a single placeholder that no count ever reaches.
+        let placeholder = [!0u32];
+        let indices = if indices.is_empty() {
+            &placeholder[..]
+        } else {
+            indices
+        };
+
+        let offsets = &mut cluster_offsets_and_counts.get_mut().data;
+        let index_list = &mut clusterable_object_index_lists.get_mut().data;
+        if offsets.as_slice() == [offset_and_counts] && index_list.as_slice() == indices {
+            return false;
+        }
+
+        offsets.clear();
+        offsets.push(offset_and_counts);
+        index_list.clear();
+        index_list.extend_from_slice(indices);
+        self.n_offsets = 1;
+        self.n_indices = indices.len();
+        true
     }
 
     pub fn write_buffers(&mut self, render_device: &RenderDevice, render_queue: &RenderQueue) {
