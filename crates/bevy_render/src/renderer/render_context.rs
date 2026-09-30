@@ -301,8 +301,12 @@ pub struct FlushCommands<'w> {
 impl<'w> FlushCommands<'w> {
     /// Flushes all pending command buffers to the render queue.
     pub fn flush(&mut self) {
-        let mut buffers = self.pending.finish().peekable();
-        if buffers.peek().is_some() {
+        let buffers: Vec<_> = self.pending.finish().collect();
+        if !buffers.is_empty() {
+            // Mirrors `submit_pending_command_buffers`'s `queue_submit` span, so mid-frame submits
+            // are visible in traces too.
+            #[cfg(feature = "trace")]
+            let _span = info_span!("flush_queue_submit", count = buffers.len()).entered();
             self.queue.submit(buffers);
         }
     }

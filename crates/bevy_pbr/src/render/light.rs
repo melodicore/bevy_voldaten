@@ -41,7 +41,6 @@ use bevy_render::batching::gpu_preprocessing::{
     BuildIndirectParametersMetadata, IndirectParametersBuffers,
 };
 use bevy_render::camera::{DirtySpecializations, PendingQueues};
-use bevy_render::diagnostic::RecordDiagnostics;
 use bevy_render::erased_render_asset::ErasedRenderAssets;
 use bevy_render::mesh::allocator::MeshSlabs;
 use bevy_render::occlusion_culling::{
@@ -60,6 +59,7 @@ use bevy_render::{
     view::{NoIndirectDrawing, RetainedViewEntity},
 };
 use bevy_render::{
+    diagnostic::RecordDiagnostics,
     mesh::RenderMesh,
     render_asset::RenderAssets,
     render_phase::*,
@@ -3421,6 +3421,11 @@ fn view_shadow_pass<const IS_LATE: bool>(
 
     let depth_stencil_attachment = Some(view_light.depth_attachment.get_attachment(StoreOp::Store));
 
+    // voldaten: GPU timing for shadow passes, which stock Bevy doesn't instrument (a no-op unless
+    // `RenderDiagnosticsPlugin` is active, i.e. in `trace_tracy` builds).
+    let diagnostics = ctx.diagnostic_recorder();
+    let diagnostics = diagnostics.as_deref();
+
     let mut render_pass = ctx.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some(&view_light.pass_name),
         color_attachments: &[],
@@ -3429,6 +3434,7 @@ fn view_shadow_pass<const IS_LATE: bool>(
         occlusion_query_set: None,
         multiview_mask: None,
     });
+    let pass_span = diagnostics.pass_span(&mut render_pass, view_light.pass_name.clone());
 
     if let Err(err) = shadow_phase.render(&mut render_pass, world, view_light_entity) {
         // voldaten diagnostic gate — see `LOG_MESH_BIND_GROUPS_ERRORS`'s own doc comment.
@@ -3436,6 +3442,8 @@ fn view_shadow_pass<const IS_LATE: bool>(
             error!("Error encountered while rendering the shadow phase {err:?}");
         }
     }
+
+    pass_span.end(&mut render_pass);
 }
 
 /// Creates the [`ClusterableObjectType`] data for a point or spot light.
