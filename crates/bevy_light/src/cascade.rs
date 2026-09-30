@@ -236,9 +236,19 @@ pub fn build_directional_light_cascades(
             let near_bounds = [cascades_config.minimum_distance]
                 .into_iter()
                 .chain(far_bounds.clone().map(|bound| overlap_factor * bound));
+            // Never fit a cascade past what the view can actually see: a view whose projection
+            // `far` is nearer than the configured bounds (e.g. a camera that only draws the slab
+            // in front of some plane) gets a correspondingly smaller cascade fit instead of a
+            // duplicate of the full-range one. Only the *fit* is clamped; the config bounds
+            // uploaded for cascade selection are left alone. Views with `far` beyond the config's
+            // last bound (the default `PerspectiveProjection` has 1000) are unaffected.
+            let view_far = projection.far();
+            debug_assert!(view_far > 0.0, "build_directional_light_cascades: non-positive projection far");
             let view_cascades = near_bounds
                 .zip(far_bounds)
                 .map(|(near_bound, far_bound)| {
+                    let near_bound = near_bound.min(view_far);
+                    let far_bound = far_bound.min(view_far);
                     // Negate bounds as -z is camera forward direction.
                     let corners = projection.get_frustum_corners(-near_bound, -far_bound);
                     calculate_cascade(
