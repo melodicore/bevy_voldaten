@@ -62,11 +62,11 @@ use bevy_ecs::{
     query::With,
     resource::Resource,
     schedule::IntoScheduleConfigs as _,
-    system::{Commands, Query, Res, ResMut},
+    system::{Commands, Local, Query, Res, ResMut},
     world::{FromWorld, World},
 };
 use bevy_light::{
-    cluster::{Clusters, GlobalClusterGpuSettings, GlobalClusterSettings},
+    cluster::{ClusterableObjectCounts, Clusters, GlobalClusterGpuSettings, GlobalClusterSettings},
     EnvironmentMapLight, IrradianceVolume,
 };
 use bevy_material::descriptor::{
@@ -813,6 +813,7 @@ fn cluster_on_gpu(
         Option<&ViewLightsUniformOffset>,
         Option<&ViewUniformOffset>,
         Option<&ExtractedClusterConfig>,
+        Option<&ViewClusterBindings>,
     )>,
     pipeline_cache: Res<PipelineCache>,
     clustering_mesh_buffers: Res<GpuClusteringMeshBuffers>,
@@ -829,9 +830,16 @@ fn cluster_on_gpu(
         Some(view_lights_uniform_offset),
         Some(view_uniform_offset),
         Some(extracted_cluster_config),
+        Some(view_cluster_bindings),
     ) = view_query.into_inner()
     else {
         trace!("Failed to match view query; not clustering");
+        return;
+    };
+
+    let Some(cluster_offsets_and_counts_buffer) = view_cluster_bindings.offsets_and_counts_buffer()
+    else {
+        trace!("Cluster offsets and counts buffer not uploaded; not clustering");
         return;
     };
 
@@ -894,6 +902,13 @@ fn cluster_on_gpu(
         view_lights_uniform_offset,
         view_uniform_offset,
     );
+
+    // The count pass accumulates into the per-cluster counts with atomics, so
+    // they have to start at zero. `prepare_clusters_for_gpu_clustering` keeps
+    // this buffer across frames instead of re-uploading it zero-filled, so
+    // reset it here. (The offsets are overwritten wholesale by the allocation
+    // pass, and the index list only ever has its allocated range read.)
+    command_encoder.clear_buffer(cluster_offsets_and_counts_buffer, 0, None);
 
     // Pass 2: Count raster.
     run_clustering_rasterization_pass(
@@ -1599,16 +1614,41 @@ pub fn extract_clusters_for_gpu_clustering(
     commands.insert_resource(global_cluster_settings.clone());
 }
 
+/// Must match `POINT_LIGHT_FLAGS_SPOT_LIGHT_BIT` in `mesh_view_types.wesl` (and
+/// `PointLightFlags::SPOT_LIGHT` in `render/light.rs`).
+const POINT_LIGHT_FLAGS_SPOT_LIGHT_BIT: u32 = 1 << 5;
+
+/// Must match `POINT_LIGHT_FLAGS_RECT_LIGHT_BIT` in `mesh_view_types.wesl` (and
+/// `PointLightFlags::RECT_LIGHT` in `render/light.rs`).
+const POINT_LIGHT_FLAGS_RECT_LIGHT_BIT: u32 = 1 << 6;
+
 /// Creates associated buffers necessary to perform GPU clustering for all
 /// views.
+///
+/// The per-view buffers live on the view entity and are kept across frames:
+/// they are only reallocated when the cluster grid or index-list capacity
+/// changes, rather than rebuilt (and re-uploaded, index list and all) every
+/// frame. The count pass's atomic counters, which a freshly zero-filled upload
+/// used to reset, are instead cleared on the GPU at the start of
+/// [`cluster_on_gpu`].
+///
+/// Views with a single cluster (`ClusterConfig::Single`) skip GPU clustering
+/// entirely: their one cluster simply lists every clusterable object, filled
+/// in on the CPU here and rewritten only when that list changes. This is a
+/// superset of what the GPU passes would produce (they additionally cull
+/// objects whose bounds miss the view frustum), which is harmless because the
+/// per-object shading already falls off to nothing outside each object's
+/// range; the list is a culling optimization, not a correctness input.
 pub(crate) fn prepare_clusters_for_gpu_clustering(
     mut commands: Commands,
-    views_query: Query<(
+    mut views_query: Query<(
         Entity,
         &MainEntity,
         &ExtractedClusterConfig,
         Option<&RenderViewLightProbes<EnvironmentMapLight>>,
         Option<&RenderViewLightProbes<IrradianceVolume>>,
+        Option<&mut ViewClusterBindings>,
+        Option<&mut ViewGpuClusteringBuffers>,
     )>,
     render_clustered_decals: Res<RenderClusteredDecals>,
     render_device: Res<RenderDevice>,
@@ -1616,6 +1656,7 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
     global_clusterable_object_meta: Res<GlobalClusterableObjectMeta>,
     global_cluster_settings: Res<GlobalClusterSettings>,
     mut render_view_clustering_index_list_sizes: ResMut<RenderViewClusteringReadbackData>,
+    mut single_cluster_indices: Local<Vec<u32>>,
 ) {
     let render_device = render_device.into_inner();
 
@@ -1634,16 +1675,88 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
         extracted_cluster_config,
         maybe_environment_maps,
         maybe_irradiance_volumes,
-    ) in &views_query
+        mut maybe_view_clusters_bindings,
+        maybe_view_gpu_clustering_buffers,
+    ) in &mut views_query
     {
-        // Allocate the cluster array.
-        let mut view_clusters_bindings =
-            ViewClusterBindings::new(BufferBindingType::Storage { read_only: false });
-        view_clusters_bindings.clear();
         let cluster_count = extracted_cluster_config.dimensions.x as usize
             * extracted_cluster_config.dimensions.y as usize
             * extracted_cluster_config.dimensions.z as usize;
-        view_clusters_bindings.reserve_clusters(cluster_count);
+
+        // Count the number of each type of clusterable object that we have.
+        let clustered_light_count = gpu_clustered_lights_storage.data.len() as u32;
+        let reflection_probe_count = match maybe_environment_maps {
+            Some(view_reflection_probes) => view_reflection_probes.len() as u32,
+            None => 0,
+        };
+        let irradiance_volume_count = match maybe_irradiance_volumes {
+            Some(view_irradiance_volumes) => view_irradiance_volumes.len() as u32,
+            None => 0,
+        };
+        // Light textures share the decal buffer but aren't clusterable objects.
+        let decal_count = render_clustered_decals.clusterable_decal_count() as u32;
+
+        if cluster_count == 1 {
+            // Single cluster: list every object, point lights before spot
+            // lights before rect lights, each type indexing into its own array
+            // (the same indexing `cluster_z_slice.wesl` assigns).
+            let lights = gpu_clustered_lights_storage.data.values();
+            let is_rect =
+                |light: &GpuClusteredLight| light.flags & POINT_LIGHT_FLAGS_RECT_LIGHT_BIT != 0;
+            let is_spot = |light: &GpuClusteredLight| {
+                !is_rect(light) && light.flags & POINT_LIGHT_FLAGS_SPOT_LIGHT_BIT != 0
+            };
+            let is_point = |light: &GpuClusteredLight| !is_rect(light) && !is_spot(light);
+            single_cluster_indices.clear();
+            single_cluster_indices.extend(
+                (0..clustered_light_count).filter(|&index| is_point(&lights[index as usize])),
+            );
+            let point_light_count = single_cluster_indices.len() as u32;
+            single_cluster_indices.extend(
+                (0..clustered_light_count).filter(|&index| is_spot(&lights[index as usize])),
+            );
+            let spot_light_count = single_cluster_indices.len() as u32 - point_light_count;
+            single_cluster_indices.extend(
+                (0..clustered_light_count).filter(|&index| is_rect(&lights[index as usize])),
+            );
+            single_cluster_indices.extend(0..reflection_probe_count);
+            single_cluster_indices.extend(0..irradiance_volume_count);
+            single_cluster_indices.extend(0..decal_count);
+            let counts = ClusterableObjectCounts {
+                point_lights: point_light_count,
+                spot_lights: spot_light_count,
+                rect_lights: clustered_light_count - point_light_count - spot_light_count,
+                reflection_probes: reflection_probe_count,
+                irradiance_volumes: irradiance_volume_count,
+                decals: decal_count,
+            };
+
+            match maybe_view_clusters_bindings.as_deref_mut() {
+                Some(view_clusters_bindings) if view_clusters_bindings.n_offsets() == 1 => {
+                    let changed =
+                        view_clusters_bindings.set_single_cluster(&counts, &single_cluster_indices);
+                    if changed || !view_clusters_bindings.storage_buffers_uploaded() {
+                        view_clusters_bindings.write_buffers(render_device, &render_queue);
+                    }
+                }
+                _ => {
+                    let mut view_clusters_bindings =
+                        ViewClusterBindings::new(BufferBindingType::Storage { read_only: false });
+                    view_clusters_bindings.set_single_cluster(&counts, &single_cluster_indices);
+                    view_clusters_bindings.write_buffers(render_device, &render_queue);
+                    commands.entity(view_entity).insert(view_clusters_bindings);
+                }
+            }
+
+            // No GPU clustering for this view. Dropping these also keeps
+            // `prepare_clustering_bind_groups`/`cluster_on_gpu` off it.
+            if maybe_view_gpu_clustering_buffers.is_some() {
+                commands
+                    .entity(view_entity)
+                    .remove::<(ViewGpuClusteringBuffers, ViewClusteringBindGroups)>();
+            }
+            continue;
+        }
 
         all_view_main_entities.insert(*view_main_entity);
 
@@ -1662,25 +1775,29 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
             continue;
         };
 
-        let mut view_gpu_clustering_buffers = ViewGpuClusteringBuffers::new();
+        // (Re)allocate the cluster array and index list only when their sizes
+        // change. Their contents are GPU-written; the one CPU-side
+        // initialization they need (zeroed counts) happens on the GPU in
+        // `cluster_on_gpu`.
+        let index_list_capacity = view_clustering_buffer_size_data.max_index_list_capacity;
+        let bindings_reusable =
+            maybe_view_clusters_bindings
+                .as_deref()
+                .is_some_and(|view_clusters_bindings| {
+                    view_clusters_bindings.n_offsets() == cluster_count
+                        && view_clusters_bindings.n_indices() == index_list_capacity
+                        && view_clusters_bindings.storage_buffers_uploaded()
+                });
+        if !bindings_reusable {
+            let mut view_clusters_bindings =
+                ViewClusterBindings::new(BufferBindingType::Storage { read_only: false });
+            view_clusters_bindings.reserve_clusters(cluster_count);
+            view_clusters_bindings.reserve_indices(index_list_capacity);
+            view_clusters_bindings.write_buffers(render_device, &render_queue);
+            commands.entity(view_entity).insert(view_clusters_bindings);
+        }
 
-        // Count the number of each type of clusterable object that we have.
-        let clustered_light_count = gpu_clustered_lights_storage.data.len() as u32;
-        let reflection_probe_count = match maybe_environment_maps {
-            Some(view_reflection_probes) => view_reflection_probes.len() as u32,
-            None => 0,
-        };
-        let irradiance_volume_count = match maybe_irradiance_volumes {
-            Some(view_irradiance_volumes) => view_irradiance_volumes.len() as u32,
-            None => 0,
-        };
-        // Light textures share the decal buffer but aren't clusterable objects.
-        let decal_count = render_clustered_decals.clusterable_decal_count() as u32;
-
-        // Initialize the metadata.
-        *view_gpu_clustering_buffers
-            .cluster_metadata_buffer
-            .get_mut() = ClusterMetadata {
+        let metadata = ClusterMetadata {
             indirect_draw_params: ClusterRasterIndirectDrawParams {
                 index_count: 6,
                 // This will be filled in by the GPU.
@@ -1693,38 +1810,46 @@ pub(crate) fn prepare_clusters_for_gpu_clustering(
             reflection_probe_count,
             irradiance_volume_count,
             decal_count,
-            index_list_capacity: view_clustering_buffer_size_data.max_index_list_capacity as u32,
+            index_list_capacity: index_list_capacity as u32,
             z_slice_list_capacity: view_clustering_buffer_size_data.z_slice_list_capacity as u32,
             farthest_z: 0,
         };
 
-        // Allocate Z slices.
-        if view_gpu_clustering_buffers.z_slices_buffer.len()
-            < view_clustering_buffer_size_data.z_slice_list_capacity
-        {
+        // `upload_view_gpu_clustering_buffers` (re)allocates these to fit.
+        let mut fresh_view_gpu_clustering_buffers = None;
+        let view_gpu_clustering_buffers = match maybe_view_gpu_clustering_buffers {
+            Some(view_gpu_clustering_buffers) => view_gpu_clustering_buffers.into_inner(),
+            None => fresh_view_gpu_clustering_buffers.insert(ViewGpuClusteringBuffers::new()),
+        };
+        *view_gpu_clustering_buffers
+            .cluster_metadata_buffer
+            .get_mut() = metadata;
+
+        let z_slices_len = view_gpu_clustering_buffers.z_slices_buffer.len();
+        if z_slices_len < view_clustering_buffer_size_data.z_slice_list_capacity {
             view_gpu_clustering_buffers.z_slices_buffer.add_multiple(
-                view_clustering_buffer_size_data.z_slice_list_capacity
-                    - view_gpu_clustering_buffers.z_slices_buffer.len(),
+                view_clustering_buffer_size_data.z_slice_list_capacity - z_slices_len,
             );
         }
 
-        // Make room for the appropriate number of indices.
-        view_clusters_bindings
-            .reserve_indices(view_clustering_buffer_size_data.max_index_list_capacity);
-        view_clusters_bindings.write_buffers(render_device, &render_queue);
-
-        // Allocate scratchpad offsets and counts.
-        view_gpu_clustering_buffers
+        let scratchpad_len = view_gpu_clustering_buffers
             .scratchpad_offsets_and_counts_buffer
-            .add_multiple(cluster_count);
+            .len();
+        if scratchpad_len < cluster_count {
+            view_gpu_clustering_buffers
+                .scratchpad_offsets_and_counts_buffer
+                .add_multiple(cluster_count - scratchpad_len);
+        }
 
-        commands
-            .entity(view_entity)
-            .insert((view_clusters_bindings, view_gpu_clustering_buffers));
+        if let Some(view_gpu_clustering_buffers) = fresh_view_gpu_clustering_buffers {
+            commands
+                .entity(view_entity)
+                .insert(view_gpu_clustering_buffers);
+        }
     }
 
     // Clear out clustering allocations corresponding to views that don't exist
-    // any longer.
+    // any longer, or that no longer cluster on the GPU.
     render_view_clustering_index_list_sizes
         .views
         .retain(|view_main_entity, _| all_view_main_entities.contains(view_main_entity));
