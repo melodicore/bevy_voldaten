@@ -18,10 +18,32 @@ use bevy_log::info_span;
 use core::marker::PhantomData;
 use wgpu::CommandBuffer;
 
+/// A finished command buffer, or an encoder whose `finish()` is deferred to
+/// [`PendingCommandBuffers::take`].
+///
+/// `wgpu` records passes lazily and does the actual backend encoding (barriers, resource
+/// tracking, the native command calls) in `CommandEncoder::finish`, which makes it the expensive
+/// step. Finishing every encoder serially on the render thread, at the end of each render system,
+/// put all of that on the critical path; deferring it lets `take` finish independent encoders in
+/// parallel.
+enum PendingCommand {
+    Buffer(CommandBuffer),
+    Encoder(CommandEncoder),
+}
+
+impl PendingCommand {
+    fn finish(self) -> CommandBuffer {
+        match self {
+            PendingCommand::Buffer(buffer) => buffer,
+            PendingCommand::Encoder(encoder) => encoder.finish(),
+        }
+    }
+}
+
+/// Buffers and encoders in submission order.
 #[derive(Default)]
 struct PendingCommandBuffersInner {
-    buffers: Vec<CommandBuffer>,
-    encoders: Vec<CommandEncoder>,
+    commands: Vec<PendingCommand>,
 }
 
 /// A resource that holds command buffers and encoders that are pending submission to the render queue.
@@ -36,34 +58,63 @@ impl Default for PendingCommandBuffers {
 
 impl PendingCommandBuffers {
     pub fn push(&mut self, buffers: impl IntoIterator<Item = CommandBuffer>) {
-        self.0.buffers.extend(buffers);
+        self.0
+            .commands
+            .extend(buffers.into_iter().map(PendingCommand::Buffer));
     }
 
+    /// Queues an unfinished encoder; it is finished in [`Self::take`], keeping its place in
+    /// submission order.
     pub fn push_encoder(&mut self, encoder: CommandEncoder) {
-        self.0.encoders.push(encoder);
+        self.0.commands.push(PendingCommand::Encoder(encoder));
     }
 
+    fn push_commands(&mut self, commands: impl IntoIterator<Item = PendingCommand>) {
+        self.0.commands.extend(commands);
+    }
+
+    /// Takes every pending command buffer in submission order, finishing any pending encoders.
+    ///
+    /// Encoders are independent of one another, so when there is more than one they are finished
+    /// in parallel on the [`ComputeTaskPool`](bevy_tasks::ComputeTaskPool); the returned order is
+    /// the order they were queued in regardless.
     pub fn take(&mut self) -> Vec<CommandBuffer> {
-        let encoders: Vec<_> = self.0.encoders.drain(..).collect();
-        for encoder in encoders {
-            self.0.buffers.push(encoder.finish());
+        let commands = core::mem::take(&mut self.0.commands);
+        let encoder_count = commands
+            .iter()
+            .filter(|command| matches!(command, PendingCommand::Encoder(_)))
+            .count();
+
+        #[cfg(feature = "trace")]
+        let _span = info_span!("finish_command_encoders", count = encoder_count).entered();
+
+        // wgpu types are only `Send` off the web.
+        #[cfg(not(target_arch = "wasm32"))]
+        if encoder_count > 1 {
+            return bevy_tasks::ComputeTaskPool::get().scope(|scope| {
+                for command in commands {
+                    scope.spawn(async move { command.finish() });
+                }
+            });
         }
-        core::mem::take(&mut self.0.buffers)
+
+        commands.into_iter().map(PendingCommand::finish).collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.buffers.is_empty() && self.0.encoders.is_empty()
+        self.0.commands.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.0.buffers.len() + self.0.encoders.len()
+        self.0.commands.len()
     }
 }
 
 #[derive(Default)]
 struct RenderContextStateInner {
     command_encoder: Option<CommandEncoder>,
-    command_buffers: Vec<CommandBuffer>,
+    /// Buffers and not-yet-finished encoders, in submission order.
+    commands: Vec<PendingCommand>,
     render_device: Option<RenderDevice>,
 }
 
@@ -79,9 +130,10 @@ impl Default for RenderContextState {
 }
 
 impl RenderContextState {
+    /// Closes the current encoder, deferring its `finish()` (see [`PendingCommand`]).
     fn flush_encoder(&mut self) {
         if let Some(encoder) = self.0.command_encoder.take() {
-            self.0.command_buffers.push(encoder.finish());
+            self.0.commands.push(PendingCommand::Encoder(encoder));
         }
     }
 
@@ -99,7 +151,10 @@ impl RenderContextState {
 
     pub fn finish(&mut self) -> Vec<CommandBuffer> {
         self.flush_encoder();
-        core::mem::take(&mut self.0.command_buffers)
+        core::mem::take(&mut self.0.commands)
+            .into_iter()
+            .map(PendingCommand::finish)
+            .collect()
     }
 }
 
@@ -111,14 +166,15 @@ impl SystemBuffer for RenderContextState {
 
         let inner = &mut *self.0;
 
-        // flush to ensure correct submission order
+        // Close the encoder to ensure correct submission order. It is finished later, in
+        // `PendingCommandBuffers::take` (see `PendingCommand`).
         if let Some(encoder) = inner.command_encoder.take() {
-            inner.command_buffers.push(encoder.finish());
+            inner.commands.push(PendingCommand::Encoder(encoder));
         }
 
-        if !inner.command_buffers.is_empty() {
+        if !inner.commands.is_empty() {
             let mut pending = world.resource_mut::<PendingCommandBuffers>();
-            pending.push(core::mem::take(&mut inner.command_buffers));
+            pending.push_commands(core::mem::take(&mut inner.commands));
         }
 
         inner.render_device = None;
@@ -177,7 +233,10 @@ impl<'w, 's> RenderContext<'w, 's> {
     /// Adds a finished command buffer to be submitted later.
     pub fn add_command_buffer(&mut self, command_buffer: CommandBuffer) {
         self.state.flush_encoder();
-        self.state.0.command_buffers.push(command_buffer);
+        self.state
+            .0
+            .commands
+            .push(PendingCommand::Buffer(command_buffer));
     }
 }
 
