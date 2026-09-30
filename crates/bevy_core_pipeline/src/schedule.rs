@@ -276,6 +276,13 @@ pub fn camera_driver(
                 bevy_log::info_span!("camera_schedule", camera = root_view.to_string()).entered();
 
             world.run_schedule(schedule);
+
+            // voldaten fork: the view's render systems all appended to one shared open encoder
+            // (see `bevy_render`'s `SharedCommands`); end it here so each view gets its own
+            // command buffer, which `PendingCommandBuffers::finish` can finish in parallel.
+            world
+                .resource_mut::<PendingCommandBuffers>()
+                .close_open_encoder();
         }
     }
     if diagnostics_enabled && !reached_root_camera {

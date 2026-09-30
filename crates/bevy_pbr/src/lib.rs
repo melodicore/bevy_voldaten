@@ -262,6 +262,9 @@ impl Plugin for PbrPlugin {
             // entity remapping on extraction, which a derive can't do) — mirrored into the
             // render world by `extract_cascade_view_override`.
             .init_resource::<CascadeViewOverride>()
+            .add_plugins(bevy_render::extract_component::ExtractComponentPlugin::<
+                NoDirectionalShadowPass,
+            >::default())
             .add_plugins((
                 MeshRenderPlugin {
                     use_gpu_instance_buffer_builder: self.use_gpu_instance_buffer_builder,
