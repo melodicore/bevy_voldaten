@@ -16,10 +16,16 @@ const MIN_HISTORY_BLEND_RATE: f32 = 0.015; // Minimum blend rate allowed, to ens
 @group(0) @binding(3) var depth: texture_depth_2d;
 @group(0) @binding(4) var nearest_sampler: sampler;
 @group(0) @binding(5) var linear_sampler: sampler;
+// Per-pixel confidence history. In ALPHA mode the main history's alpha channel holds the resolved
+// alpha instead, so the confidence counter lives here.
+@if(ALPHA)
+@group(0) @binding(6) var history_confidence_tex: texture_2d<f32>;
 
 struct Output {
     @location(0) view_target: vec4<f32>,
     @location(1) history: vec4<f32>,
+    @if(ALPHA)
+    @location(2) confidence: f32,
 };
 
 // TAA is ideally applied after tonemapping, but before post processing
@@ -62,8 +68,13 @@ fn clip_towards_aabb_center(history_color: vec3<f32>, current_color: vec3<f32>, 
     }
 }
 
-fn sample_history(u: f32, v: f32) -> vec3<f32> {
-    return textureSample(history, linear_sampler, vec2(u, v)).rgb;
+// ALPHA mode resolves premultiplied colour AND alpha, so the history sample carries alpha too.
+fn sample_history(u: f32, v: f32) -> vec4<f32> {
+    return textureSample(history, linear_sampler, vec2(u, v));
+}
+
+fn sample_view_alpha(uv: vec2<f32>) -> f32 {
+    return textureSample(view_target, nearest_sampler, uv).a;
 }
 
 fn sample_view_target(uv: vec2<f32>) -> vec3<f32> {
@@ -81,6 +92,7 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
     // Fetch the current sample
     let original_color = textureSample(view_target, nearest_sampler, uv);
     var current_color = original_color.rgb;
+    var current_alpha = original_color.a;
 @if(TONEMAP)
     current_color = tonemap(current_color);
 
@@ -133,11 +145,14 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
     let texel_position_0 = (texel_center - 1.0) * texel_size;
     let texel_position_3 = (texel_center + 2.0) * texel_size;
     let texel_position_12 = (texel_center + (w2 / w12)) * texel_size;
-    var history_color = sample_history(texel_position_12.x, texel_position_0.y) * w12.x * w0.y;
-    history_color += sample_history(texel_position_0.x, texel_position_12.y) * w0.x * w12.y;
-    history_color += sample_history(texel_position_12.x, texel_position_12.y) * w12.x * w12.y;
-    history_color += sample_history(texel_position_3.x, texel_position_12.y) * w3.x * w12.y;
-    history_color += sample_history(texel_position_12.x, texel_position_3.y) * w12.x * w3.y;
+    var history_sample = sample_history(texel_position_12.x, texel_position_0.y) * w12.x * w0.y;
+    history_sample += sample_history(texel_position_0.x, texel_position_12.y) * w0.x * w12.y;
+    history_sample += sample_history(texel_position_12.x, texel_position_12.y) * w12.x * w12.y;
+    history_sample += sample_history(texel_position_3.x, texel_position_12.y) * w3.x * w12.y;
+    history_sample += sample_history(texel_position_12.x, texel_position_3.y) * w12.x * w3.y;
+    var history_color = history_sample.rgb;
+@if(ALPHA)
+    var history_alpha = history_sample.a;
 
     // Constrain past sample with 3x3 YCoCg variance clipping (reduces ghosting)
     // YCoCg: https://advances.realtimerendering.com/s2014/index.html#_HIGH-QUALITY_TEMPORAL_SUPERSAMPLING, slide 33
@@ -160,7 +175,28 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
     history_color = clip_towards_aabb_center(history_color, s_mm, mean - std_deviation, mean + std_deviation);
     history_color = YCoCg_to_RGB(history_color);
 
+@if(ALPHA) {
+    // Keep the reprojected alpha within the current 3x3 neighbourhood's alpha range: a moved or
+    // vanished edge can't leave a ghost trail, while an edge texel whose neighbours span 0..1
+    // (jitter alternately covers/uncovers it) keeps the full accumulated coverage.
+    let a_tl = sample_view_alpha(uv + vec2(-texel_size.x,  texel_size.y));
+    let a_tm = sample_view_alpha(uv + vec2( 0.0,           texel_size.y));
+    let a_tr = sample_view_alpha(uv + vec2( texel_size.x,  texel_size.y));
+    let a_ml = sample_view_alpha(uv + vec2(-texel_size.x,  0.0));
+    let a_mm = original_color.a;
+    let a_mr = sample_view_alpha(uv + vec2( texel_size.x,  0.0));
+    let a_bl = sample_view_alpha(uv + vec2(-texel_size.x, -texel_size.y));
+    let a_bm = sample_view_alpha(uv + vec2( 0.0,          -texel_size.y));
+    let a_br = sample_view_alpha(uv + vec2( texel_size.x, -texel_size.y));
+    let alpha_min = min(min(min(a_tl, a_tm), min(a_tr, a_ml)), min(min(a_mm, a_mr), min(a_bl, min(a_bm, a_br))));
+    let alpha_max = max(max(max(a_tl, a_tm), max(a_tr, a_ml)), max(max(a_mm, a_mr), max(a_bl, max(a_bm, a_br))));
+    history_alpha = clamp(history_alpha, alpha_min, alpha_max);
+}
+
     // How confident we are that the history is representative of the current frame
+@if(ALPHA)
+    history_confidence = textureSample(history_confidence_tex, nearest_sampler, uv).r;
+@else
     history_confidence = textureSample(history, nearest_sampler, uv).a;
     let pixel_motion_vector = abs(closest_motion_vector) * texture_size;
     if pixel_motion_vector.x < 0.01 && pixel_motion_vector.y < 0.01 {
@@ -183,6 +219,8 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
     }
 
     current_color = mix(history_color, current_color, current_color_factor);
+@if(ALPHA)
+    current_alpha = mix(history_alpha, current_alpha, current_color_factor);
 } // !RESET
 
 
@@ -190,9 +228,18 @@ fn taa(@location(0) uv: vec2<f32>) -> Output {
     var out: Output;
 @if(RESET)
     history_confidence = 1.0 / MIN_HISTORY_BLEND_RATE;
+@if(ALPHA) {
+    // Premultiplied colour + resolved alpha in the history, confidence in its own texture.
+    out.history = vec4(current_color, current_alpha);
+    out.confidence = history_confidence;
+}
+@else
     out.history = vec4(current_color, history_confidence);
 @if(TONEMAP)
     current_color = reverse_tonemap(current_color);
+@if(ALPHA)
+    out.view_target = vec4(current_color, current_alpha);
+@else
     out.view_target = vec4(current_color, original_color.a);
     return out;
 }
