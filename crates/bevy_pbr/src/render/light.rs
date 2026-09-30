@@ -54,6 +54,7 @@ use bevy_render::view::{
 use bevy_render::{
     batching::gpu_preprocessing::{GpuPreprocessingMode, GpuPreprocessingSupport},
     camera::SortedCameras,
+    extract_component::ExtractComponent,
     extract_resource::ExtractResource,
     mesh::allocator::MeshAllocator,
     view::{NoIndirectDrawing, RetainedViewEntity},
@@ -502,6 +503,14 @@ pub fn extract_shadow_rotation_compensation(
 /// against, it does not exempt `source` from needing to actually receive the light itself.
 #[derive(Resource, Default, Clone)]
 pub struct CascadeViewOverride(pub EntityHashMap<Entity>);
+
+/// Camera component (voldaten fork): this view renders no directional-light shadow maps and
+/// shades as if its directional lights had shadows disabled, while its cascades are still *fit*
+/// main-world side as usual. For a view that exists only as a `CascadeViewOverride` source: every
+/// view's directional cascades restart at array layer 0, so a source view's own shadow render is
+/// overwritten by the next shadow-mapped view's before anything reads it.
+#[derive(Component, Clone, Copy, Default, Debug, ExtractComponent)]
+pub struct NoDirectionalShadowPass;
 
 /// Render-world mirror of `CascadeViewOverride`, with both the key and value remapped from
 /// main-world to render-world entity ids via each entity's own `RenderEntity` component — a
@@ -1217,6 +1226,7 @@ pub fn prepare_lights(
             Option<&RenderLayers>,
             Has<NoIndirectDrawing>,
             Option<&AmbientLight>,
+            Has<NoDirectionalShadowPass>,
         ),
         With<Camera3d>,
     >,
@@ -1653,6 +1663,7 @@ pub fn prepare_lights(
         maybe_layers,
         _no_indirect_drawing,
         _maybe_ambient_override,
+        _no_directional_shadow_pass,
     ) in sorted_cameras
         .0
         .iter()
@@ -1968,6 +1979,7 @@ pub fn prepare_lights(
         maybe_layers,
         no_indirect_drawing,
         maybe_ambient_override,
+        no_directional_shadow_pass,
     ) in sorted_cameras
         .0
         .iter()
@@ -2033,7 +2045,9 @@ pub fn prepare_lights(
 
             // Shadow enabled lights are second
             let mut num_cascades = 0;
-            if light.shadow_maps_enabled {
+            // With the flag left unset, the cascade loop below also despawns and skips this view's
+            // shadow views for the light.
+            if light.shadow_maps_enabled && !no_directional_shadow_pass {
                 let cascades = light
                     .cascade_shadow_config
                     .bounds
