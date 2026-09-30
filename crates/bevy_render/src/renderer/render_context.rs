@@ -18,13 +18,10 @@ use bevy_ecs::world::DeferredWorld;
 use bevy_log::info_span;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_tasks::ComputeTaskPool;
+use alloc::sync::Arc;
 use core::marker::PhantomData;
+use std::sync::{Mutex, MutexGuard};
 use wgpu::CommandBuffer;
-
-#[derive(Default)]
-struct PendingCommandBuffersInner {
-    commands: Vec<PendingCommandBuffer>,
-}
 
 enum PendingCommandBuffer {
     Buffer(CommandBuffer),
@@ -35,65 +32,139 @@ enum PendingCommandBuffer {
     },
 }
 
-wgpu_wrapper!(struct WgpuPendingCommandBuffersInner(PendingCommandBuffersInner));
+impl PendingCommandBuffer {
+    fn encoder(encoder: CommandEncoder, name: impl Into<Cow<'static, str>>) -> Self {
+        #[cfg(not(feature = "trace"))]
+        let _ = name;
+
+        PendingCommandBuffer::Encoder {
+            encoder,
+            #[cfg(feature = "trace")]
+            name: name.into(),
+        }
+    }
+}
+
+/// Buffers and encoders in submission order, plus the currently *open* encoder, which comes after
+/// all of them.
+///
+/// **Shared, not per-system (voldaten fork).** Every `RenderContext` records into the one open
+/// encoder instead of creating its own, so consecutive render systems — a camera's whole `Core3d`
+/// invocation, say — append to a single command buffer rather than producing one each. wgpu's
+/// per-command-buffer cost (submit-time validation and barrier recording, and later
+/// `drop command buffer trackers` in `Device::maintain`, each ~10µs) was being paid ~116 times a
+/// frame. `camera_driver` closes the open encoder after every view
+/// ([`PendingCommandBuffers::close_open_encoder`]), so there is still one encoder per view for
+/// [`PendingCommandBuffers::finish`] to finish in parallel.
+///
+/// A `RenderContext` takes the open encoder out of here the first time it records and puts it back
+/// when it is dropped at the end of its system — no lock is held while recording. That is only
+/// order-correct because render systems that record never run concurrently: `Core2d`/`Core3d` (app
+/// side) and `ShadowMapSchedule` (fork) use the single-threaded executor, and `camera_driver` runs
+/// views one after another. A second encoder opened concurrently would still be submitted, just
+/// not in a defined order relative to the first (see `RenderContext`'s `Drop`).
+#[derive(Default)]
+struct SharedCommands {
+    commands: Vec<PendingCommandBuffer>,
+    open: Option<CommandEncoder>,
+}
+
+impl SharedCommands {
+    /// Moves the open encoder (if any) to the end of `commands`.
+    fn close_open_encoder(&mut self) {
+        if let Some(encoder) = self.open.take() {
+            self.commands
+                .push(PendingCommandBuffer::encoder(encoder, "shared_encoder"));
+        }
+    }
+}
+
+wgpu_wrapper!(struct WgpuSharedCommands(SharedCommands));
+
+type SharedCommandsHandle = Arc<Mutex<WgpuSharedCommands>>;
+
+fn lock_shared(shared: &SharedCommandsHandle) -> MutexGuard<'_, WgpuSharedCommands> {
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// A resource that holds command buffers and encoders that are pending submission to the render queue.
 #[derive(Resource)]
-pub struct PendingCommandBuffers(WgpuPendingCommandBuffersInner);
+pub struct PendingCommandBuffers(SharedCommandsHandle);
 
-impl Default for PendingCommandBuffers {
-    fn default() -> Self {
-        Self(WgpuPendingCommandBuffersInner::new(
-            PendingCommandBuffersInner::default(),
-        ))
+/// Reuses the existing shared list (emptied) when the resource already exists. It is
+/// (re)inserted by `init_gpu_resource` in `RenderStartup` — including after device recovery — and
+/// every `RenderContextState` holds on to the list it was initialized with, so replacing it with a
+/// fresh one would leave those recording into a list nothing ever submits.
+impl FromWorld for PendingCommandBuffers {
+    fn from_world(world: &mut World) -> Self {
+        match world.get_resource::<PendingCommandBuffers>() {
+            Some(existing) => {
+                let shared = existing.0.clone();
+                **lock_shared(&shared) = SharedCommands::default();
+                Self(shared)
+            }
+            None => Self(Arc::new(Mutex::new(WgpuSharedCommands::new(
+                SharedCommands::default(),
+            )))),
+        }
     }
 }
 
 impl PendingCommandBuffers {
     pub fn push(&mut self, buffers: impl IntoIterator<Item = CommandBuffer>) {
-        self.0
+        let mut shared = lock_shared(&self.0);
+        shared.close_open_encoder();
+        shared
             .commands
             .extend(buffers.into_iter().map(PendingCommandBuffer::Buffer));
     }
 
-    fn append(&mut self, commands: &mut Vec<PendingCommandBuffer>) {
-        self.0.commands.append(commands);
+    pub fn push_encoder(&mut self, encoder: CommandEncoder, name: impl Into<Cow<'static, str>>) {
+        let mut shared = lock_shared(&self.0);
+        shared.close_open_encoder();
+        shared
+            .commands
+            .push(PendingCommandBuffer::encoder(encoder, name));
     }
 
-    pub fn push_encoder(&mut self, encoder: CommandEncoder, name: impl Into<Cow<'static, str>>) {
-        #[cfg(not(feature = "trace"))]
-        let _ = name;
-
-        self.0.commands.push(PendingCommandBuffer::Encoder {
-            encoder,
-            #[cfg(feature = "trace")]
-            name: name.into(),
-        });
+    /// Ends the shared open encoder that `RenderContext`s record into, so the next recording
+    /// starts a new one. Called by `camera_driver` after every view, keeping one encoder per view
+    /// for [`Self::finish`] to finish in parallel.
+    pub fn close_open_encoder(&mut self) {
+        lock_shared(&self.0).close_open_encoder();
     }
 
     pub fn finish(&mut self) -> impl Iterator<Item = CommandBuffer> {
         #[cfg(feature = "trace")]
         let _finish_command_buffers_span = info_span!("finish_command_buffers").entered();
 
-        let commands = self.0.commands.drain(..);
+        let commands = {
+            let mut shared = lock_shared(&self.0);
+            shared.close_open_encoder();
+            core::mem::take(&mut shared.commands)
+        };
 
         #[cfg(target_arch = "wasm32")]
         {
-            finish_sequential(commands)
+            finish_sequential(commands.into_iter())
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            finish_parallel(commands)
+            finish_parallel(commands.into_iter())
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.commands.is_empty()
+        let shared = lock_shared(&self.0);
+        shared.commands.is_empty() && shared.open.is_none()
     }
 
     pub fn len(&self) -> usize {
-        self.0.commands.len()
+        let shared = lock_shared(&self.0);
+        shared.commands.len() + usize::from(shared.open.is_some())
     }
 }
 
@@ -147,83 +218,89 @@ fn finish_parallel(
         .map(|(_, command_buffer)| command_buffer)
 }
 
-#[derive(Default)]
 struct RenderContextStateInner {
+    /// The shared open encoder, while this system has it checked out (see [`SharedCommands`]).
     command_encoder: Option<CommandEncoder>,
-    commands: Vec<PendingCommandBuffer>,
     render_device: Option<RenderDevice>,
-}
-
-impl RenderContextStateInner {
-    fn flush_encoder(&mut self) {
-        if let Some(encoder) = self.command_encoder.take() {
-            self.commands.push(PendingCommandBuffer::Encoder {
-                encoder,
-                #[cfg(feature = "trace")]
-                name: "RenderContextState::flush_encoder".into(),
-            });
-        }
-    }
 }
 
 wgpu_wrapper!(struct WgpuRenderContextStateInner(RenderContextStateInner));
 
-/// A resource that holds the current render context state, including command encoder and command buffers.
-/// This is used internally by the [`RenderContext`] system parameter. Implements [`SystemBuffer`] to
-/// append command buffers and unfinished encoders in topological system order. Pending encoders are
-/// finished in parallel immediately before submission.
-pub struct RenderContextState(WgpuRenderContextStateInner);
+/// Per-system state of the [`RenderContext`] system parameter: the shared command list (see
+/// [`SharedCommands`]) and, while the system runs, the encoder it has checked out of it.
+pub struct RenderContextState {
+    shared: SharedCommandsHandle,
+    inner: WgpuRenderContextStateInner,
+}
 
-impl Default for RenderContextState {
-    fn default() -> Self {
-        Self(WgpuRenderContextStateInner::new(
-            RenderContextStateInner::default(),
-        ))
+impl FromWorld for RenderContextState {
+    fn from_world(world: &mut World) -> Self {
+        let shared = world
+            .get_resource_or_init::<PendingCommandBuffers>()
+            .0
+            .clone();
+        Self {
+            shared,
+            inner: WgpuRenderContextStateInner::new(RenderContextStateInner {
+                command_encoder: None,
+                render_device: None,
+            }),
+        }
     }
 }
 
 impl RenderContextState {
-    fn flush_encoder(&mut self) {
-        self.0.flush_encoder();
+    /// Checks the shared open encoder out (or starts a new one) on first use.
+    fn command_encoder(&mut self, label: &str) -> &mut CommandEncoder {
+        if self.inner.command_encoder.is_none() {
+            let open = lock_shared(&self.shared).open.take();
+            let render_device = self
+                .inner
+                .render_device
+                .clone()
+                .expect("RenderDevice must be set before accessing command_encoder");
+            self.inner.command_encoder = Some(open.unwrap_or_else(|| {
+                render_device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
+            }));
+        }
+        self.inner.command_encoder.as_mut().unwrap()
     }
 
-    fn command_encoder(&mut self, label: &str) -> &mut CommandEncoder {
-        let render_device = self
-            .0
-            .render_device
-            .clone()
-            .expect("RenderDevice must be set before accessing command_encoder");
+    /// Ends the encoder this system is recording into (the checked-out one, else the shared open
+    /// one), so whatever is queued next comes after it.
+    fn close_encoder(&mut self) {
+        let mut shared = lock_shared(&self.shared);
+        shared.close_open_encoder();
+        if let Some(encoder) = self.inner.command_encoder.take() {
+            shared
+                .commands
+                .push(PendingCommandBuffer::encoder(encoder, "shared_encoder"));
+        }
+    }
 
-        self.0.command_encoder.get_or_insert_with(|| {
-            render_device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
-        })
+    /// Returns the checked-out encoder to the shared slot, to be continued by the next recording
+    /// system.
+    fn check_in(&mut self) {
+        if let Some(encoder) = self.inner.command_encoder.take() {
+            let mut shared = lock_shared(&self.shared);
+            // Only possible if another system recorded concurrently; order between the two is then
+            // undefined, but nothing is lost.
+            shared.close_open_encoder();
+            shared.open = Some(encoder);
+        }
+        self.inner.render_device = None;
     }
 }
 
 impl SystemBuffer for RenderContextState {
-    fn queue(&mut self, _system_meta: &SystemMeta, mut world: DeferredWorld) {
-        #[cfg(feature = "trace")]
-        let _span =
-            info_span!("RenderContextState::apply", system = %_system_meta.name()).entered();
-
-        let inner = &mut *self.0;
-
-        inner.flush_encoder();
-
-        #[cfg(feature = "trace")]
-        for command in &mut inner.commands {
-            if let PendingCommandBuffer::Encoder { name, .. } = command {
-                *name = _system_meta.name().clone().into();
-            }
-        }
-
-        if !inner.commands.is_empty() {
-            let mut pending = world.resource_mut::<PendingCommandBuffers>();
-            pending.append(&mut inner.commands);
-        }
-
-        inner.render_device = None;
+    fn queue(&mut self, _system_meta: &SystemMeta, _world: DeferredWorld) {
+        // Nothing left to do: everything was recorded into the shared command list while the
+        // system ran, and `RenderContext`'s `Drop` already returned the encoder.
+        debug_assert!(
+            self.inner.command_encoder.is_none(),
+            "RenderContext encoder was not checked back in"
+        );
     }
 }
 
@@ -238,10 +315,18 @@ pub struct RenderContext<'w, 's> {
     diagnostics_recorder: Option<Res<'w, DiagnosticsRecorder>>,
 }
 
+impl Drop for RenderContext<'_, '_> {
+    /// Hands the encoder this system recorded into back to the shared slot, so the next render
+    /// system appends to it (see [`SharedCommands`]).
+    fn drop(&mut self) {
+        self.state.check_in();
+    }
+}
+
 impl<'w, 's> RenderContext<'w, 's> {
     fn ensure_device(&mut self) {
-        if self.state.0.render_device.is_none() {
-            self.state.0.render_device = Some(self.render_device.clone());
+        if self.state.inner.render_device.is_none() {
+            self.state.inner.render_device = Some(self.render_device.clone());
         }
     }
 
@@ -268,22 +353,17 @@ impl<'w, 's> RenderContext<'w, 's> {
     ) -> TrackedRenderPass<'a> {
         self.ensure_device();
 
-        let command_encoder = self.state.0.command_encoder.get_or_insert_with(|| {
-            self.render_device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some(self.system_name.as_str()),
-                })
-        });
-
-        let render_pass = command_encoder.begin_render_pass(&descriptor);
+        let render_pass = self
+            .state
+            .command_encoder(self.system_name.as_str())
+            .begin_render_pass(&descriptor);
         TrackedRenderPass::new(&self.render_device, render_pass)
     }
 
     /// Adds a finished command buffer to be submitted later.
     pub fn add_command_buffer(&mut self, command_buffer: CommandBuffer) {
-        self.state.flush_encoder();
-        self.state
-            .0
+        self.state.close_encoder();
+        lock_shared(&self.state.shared)
             .commands
             .push(PendingCommandBuffer::Buffer(command_buffer));
     }
