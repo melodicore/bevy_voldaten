@@ -1130,6 +1130,23 @@ fn pipeline_error_context(cached_pipeline: &CachedPipeline) -> String {
     }
 }
 
+/// The pool sync-mode pipeline compiles run on (see `create_pipeline_task`): one thread per
+/// logical core, created on first use. Its threads park once the compile burst is done.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(target_os = "macos"),
+    feature = "multi_threaded"
+))]
+fn sync_compile_pool() -> &'static bevy_tasks::TaskPool {
+    static POOL: std::sync::OnceLock<bevy_tasks::TaskPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        bevy_tasks::TaskPoolBuilder::new()
+            .num_threads(bevy_tasks::available_parallelism())
+            .thread_name("Pipeline Compile Task Pool".to_string())
+            .build()
+    })
+}
+
 #[cfg(all(
     not(target_arch = "wasm32"),
     not(target_os = "macos"),
@@ -1137,15 +1154,26 @@ fn pipeline_error_context(cached_pipeline: &CachedPipeline) -> String {
 ))]
 fn create_pipeline_task(
     task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
-    _sync: bool,
+    sync: bool,
 ) -> CachedPipelineState {
-    // Always spawn onto AsyncComputeTaskPool, regardless of `sync` — `sync` no longer controls
-    // whether this compile runs concurrently, only whether `process_queue`'s caller blocks until
-    // it (and every other pipeline queued this call) finishes before returning (see
-    // `process_queue`'s phase 2). Spawning is not lazy, so every queued pipeline starts compiling
-    // on a pool worker thread immediately, in parallel with however many others are also queued
-    // this call — this is what lets shader compilation actually use more than one core.
-    CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(task))
+    // Always spawn, regardless of `sync` — `sync` doesn't control whether this compile runs
+    // concurrently, only whether `process_queue`'s caller blocks until it (and every other
+    // pipeline queued this call) finishes before returning (see `process_queue`'s phase 2).
+    // Spawning is not lazy, so every queued pipeline starts compiling on a pool worker thread
+    // immediately, in parallel with however many others are also queued this call.
+    //
+    // In sync mode the compile goes onto `sync_compile_pool`, a dedicated pool with one thread
+    // per logical core, not onto any of Bevy's global pools: `AsyncComputeTaskPool` is capped at
+    // 4 threads by `TaskPoolOptions::default()` (25% of cores, max 4) and shared with
+    // long-running app tasks, and `ComputeTaskPool` only gets the cores left over after the IO
+    // and async-compute pools. A sync-mode compile burst blocks the frame anyway, so it should
+    // use every core, even at the cost of oversubscribing against the global pools' threads.
+    let task = if sync {
+        sync_compile_pool().spawn(task)
+    } else {
+        bevy_tasks::AsyncComputeTaskPool::get().spawn(task)
+    };
+    CachedPipelineState::Creating(task)
 }
 
 #[cfg(any(
