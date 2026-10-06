@@ -10,7 +10,7 @@ use bevy_log::info_span;
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
-    render_phase::ViewSortedRenderPhases,
+    render_phase::{is_mesh_bind_groups_failure, ViewSortedRenderPhases, LOG_MESH_BIND_GROUPS_ERRORS},
     render_resource::{PipelineCache, RenderPassDescriptor, StoreOp},
     renderer::{RenderContext, ViewQuery},
     view::{ExtractedView, ViewDepthStencilTexture, ViewTarget},
@@ -93,7 +93,10 @@ pub fn main_transparent_pass_3d(
         }
 
         if let Err(err) = transparent_phase.render(&mut render_pass, world, view_entity) {
-            error!("Error encountered while rendering the transparent phase {err:?}");
+            // voldaten diagnostic gate — see `LOG_MESH_BIND_GROUPS_ERRORS`'s own doc comment.
+            if !is_mesh_bind_groups_failure(&err) || LOG_MESH_BIND_GROUPS_ERRORS.load(core::sync::atomic::Ordering::Relaxed) {
+                error!("Error encountered while rendering the transparent phase {err:?}");
+            }
         }
 
         pass_span.end(&mut render_pass);
