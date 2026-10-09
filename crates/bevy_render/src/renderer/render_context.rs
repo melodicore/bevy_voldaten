@@ -25,22 +25,44 @@ use wgpu::CommandBuffer;
 
 enum PendingCommandBuffer {
     Buffer(CommandBuffer),
+    /// An encoder to finish at submission (wasm, where encoders can't cross threads).
+    #[cfg(target_arch = "wasm32")]
     Encoder {
         encoder: CommandEncoder,
         #[cfg(feature = "trace")]
         name: Cow<'static, str>,
     },
+    /// An encoder being finished on the [`ComputeTaskPool`] since it was queued (voldaten fork).
+    #[cfg(not(target_arch = "wasm32"))]
+    Finishing(bevy_tasks::Task<CommandBuffer>),
 }
 
 impl PendingCommandBuffer {
+    /// Queues a recorded encoder. Off the web its `finish()` — wgpu's actual backend encoding, the
+    /// expensive step — starts right away on the compute pool, overlapping with the recording of
+    /// the views that follow; [`PendingCommandBuffers::finish`] then only collects the results.
     fn encoder(encoder: CommandEncoder, name: impl Into<Cow<'static, str>>) -> Self {
         #[cfg(not(feature = "trace"))]
         let _ = name;
 
-        PendingCommandBuffer::Encoder {
-            encoder,
+        #[cfg(target_arch = "wasm32")]
+        {
+            PendingCommandBuffer::Encoder {
+                encoder,
+                #[cfg(feature = "trace")]
+                name: name.into(),
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
             #[cfg(feature = "trace")]
-            name: name.into(),
+            let name: Cow<'static, str> = name.into();
+            PendingCommandBuffer::Finishing(ComputeTaskPool::get().spawn(async move {
+                #[cfg(feature = "trace")]
+                let _span = info_span!("finish_command_buffer", system = name.as_ref()).entered();
+                encoder.finish()
+            }))
         }
     }
 }
@@ -54,8 +76,9 @@ impl PendingCommandBuffer {
 /// per-command-buffer cost (submit-time validation and barrier recording, and later
 /// `drop command buffer trackers` in `Device::maintain`, each ~10µs) was being paid ~116 times a
 /// frame. `camera_driver` closes the open encoder after every view
-/// ([`PendingCommandBuffers::close_open_encoder`]), so there is still one encoder per view for
-/// [`PendingCommandBuffers::finish`] to finish in parallel.
+/// ([`PendingCommandBuffers::close_open_encoder`]), so there is still one encoder per view, and each
+/// starts finishing on the compute pool the moment it is closed (see [`PendingCommandBuffer::encoder`])
+/// while the render thread records the next view.
 ///
 /// A `RenderContext` takes the open encoder out of here the first time it records and puts it back
 /// when it is dropped at the end of its system — no lock is held while recording. That is only
@@ -153,7 +176,7 @@ impl PendingCommandBuffers {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            finish_parallel(commands.into_iter())
+            finish_in_order(commands)
         }
     }
 
@@ -182,40 +205,24 @@ fn finish_sequential(
     })
 }
 
-/// Finishes pending command encoders in parallel on the [`ComputeTaskPool`],
-/// then reassembles the command buffers in their original order.
+/// Collects the command buffers in submission order, waiting for any encoder still being finished
+/// on the [`ComputeTaskPool`] (each started when it was queued). Collected eagerly, so the waiting
+/// happens here rather than inside wgpu's `Queue::submit`.
+///
+/// The wait does not help run pool tasks, so this must not be called from a `ComputeTaskPool`
+/// worker (on a machine with one compute thread it would wait on itself). Its callers —
+/// `submit_pending_command_buffers` and [`FlushCommands::flush`] in camera-driven schedules — run
+/// on the render thread.
 #[cfg(not(target_arch = "wasm32"))]
-fn finish_parallel(
-    commands: impl Iterator<Item = PendingCommandBuffer>,
-) -> impl Iterator<Item = CommandBuffer> {
-    let mut command_buffers = Vec::with_capacity(commands.size_hint().0);
-    let mut finished_encoders = ComputeTaskPool::get().scope(|scope| {
-        for (index, command) in commands.into_iter().enumerate() {
-            match command {
-                PendingCommandBuffer::Buffer(command_buffer) => {
-                    command_buffers.push((index, command_buffer));
-                }
-                PendingCommandBuffer::Encoder {
-                    encoder,
-                    #[cfg(feature = "trace")]
-                    name,
-                } => {
-                    scope.spawn(async move {
-                        #[cfg(feature = "trace")]
-                        let _span =
-                            info_span!("finish_command_buffer", system = name.as_ref()).entered();
-                        (index, encoder.finish())
-                    });
-                }
-            }
-        }
-    });
-
-    command_buffers.append(&mut finished_encoders);
-    command_buffers.sort_unstable_by_key(|(index, _)| *index);
-    command_buffers
+fn finish_in_order(commands: Vec<PendingCommandBuffer>) -> impl Iterator<Item = CommandBuffer> {
+    commands
         .into_iter()
-        .map(|(_, command_buffer)| command_buffer)
+        .map(|command| match command {
+            PendingCommandBuffer::Buffer(command_buffer) => command_buffer,
+            PendingCommandBuffer::Finishing(task) => bevy_tasks::block_on(task),
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 struct RenderContextStateInner {
