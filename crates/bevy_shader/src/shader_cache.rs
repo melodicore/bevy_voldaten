@@ -327,7 +327,24 @@ impl<ShaderModule, RenderDevice> ShaderCache<ShaderModule, RenderDevice> {
                                 }
                             }
 
-                            ShaderCacheSource::Wgsl(compiled.to_string())
+                            let mut wgsl = compiled.to_string();
+                            // voldaten fork: opt-in forced early depth/stencil testing. WESL has no
+                            // spelling for naga's `@early_depth_test(force)` (its parser accepts
+                            // only the conservative-depth arguments), so it is inserted into the
+                            // compiled WGSL here. Needed by fragment shaders that write storage:
+                            // without it a driver may move the depth test after the shader to keep
+                            // the writes of occluded fragments observable, shading every one of
+                            // them. Requires `Features::SHADER_EARLY_DEPTH_TEST`.
+                            let force_early_depth = shader_defs
+                                .iter()
+                                .chain(shader.shader_defs.iter())
+                                .any(|def| {
+                                    matches!(def, ShaderDefVal::Bool(key, true) if key.as_ref() == "EARLY_DEPTH_TEST_FORCE")
+                                });
+                            if force_early_depth {
+                                wgsl = wgsl.replace("@fragment", "@early_depth_test(force) @fragment");
+                            }
+                            ShaderCacheSource::Wgsl(wgsl)
                         } else {
                             return Err(ShaderCacheError::ProcessShaderError(format!(
                                 "Wesl shader `{}` has a malformed import path `{:?}`",
