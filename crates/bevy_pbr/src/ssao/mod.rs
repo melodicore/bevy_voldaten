@@ -27,7 +27,7 @@ use bevy_render::{
         },
         *,
     },
-    renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue, ViewQuery},
+    renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery},
     sync_component::SyncComponentPlugin,
     sync_world::RenderEntity,
     texture::{CachedTexture, TextureCache},
@@ -298,17 +298,12 @@ impl FromWorld for SsaoPipelines {
         let render_queue = world.resource::<RenderQueue>();
         let pipeline_cache = world.resource::<PipelineCache>();
 
-        // Detect the depth format support
-        let render_adapter = world.resource::<RenderAdapter>();
-        let depth_format = if render_adapter
-            .get_texture_format_features(TextureFormat::R16Float)
-            .allowed_usages
-            .contains(TextureUsages::STORAGE_BINDING)
-        {
-            TextureFormat::R16Float
-        } else {
-            TextureFormat::R32Float
-        };
+        // Always full precision (voldaten fork). The preprocessed depth chain stores raw
+        // (non-linear, reverse-Z) depth; at half precision a surface at a shallow angle to the
+        // view plane quantizes into flat terraces, and the horizon test (normalized by PI) reads
+        // each terrace edge as an occluder, banding the whole face. The `USE_R16FLOAT` shader path
+        // stays, unused.
+        let depth_format = TextureFormat::R32Float;
 
         let hilbert_index_lut = render_device
             .create_texture_with_data(
