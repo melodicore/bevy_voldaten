@@ -10,8 +10,6 @@
 //! Source code base on SSRT3 implementation
 //! https://github.com/cdrinmatane/SSRT3
 
-import bevy_render::maths::fast_acos;
-
 import bevy_render::{
     view::View,
     globals::Globals,
@@ -105,7 +103,12 @@ fn updateSectors(
     bitmask: u32,
 ) -> u32 {
     let start_horizon = u32(min_horizon * samples_per_slice);
-    let angle_horizon = u32(ceil((max_horizon - min_horizon) * samples_per_slice));
+    // A sample on the pixel's own tangent plane lands on a sector boundary, so `ceil` would turn
+    // any error there into a whole occluded sector. The prepass normal (`Rgb10a2Unorm`, world
+    // space) is quantized to ~1e-3 rad, and that error changes as an object rotates, so flat faces
+    // flickered between occluded and not. Spans under `SECTOR_TOLERANCE` of a sector are dropped.
+    const SECTOR_TOLERANCE = 0.05;
+    let angle_horizon = u32(max(ceil((max_horizon - min_horizon) * samples_per_slice - SECTOR_TOLERANCE), 0.0));
 
     return insertBits(bitmask, 0xFFFFFFFFu, start_horizon, angle_horizon);
 }
@@ -120,9 +123,13 @@ fn processSample(
 ) {
     let delta_position_back_face = delta_position - view_vec * settings.thickness;
 
+    // Exact `acos`, not `fast_acos`: a sample on the pixel's own tangent plane lands exactly on a
+    // sector boundary, and `updateSectors`' `ceil` turns any positive error there into a whole
+    // occluded sector. `fast_acos`'s error (up to ~9e-3 rad, varying with the argument) doesn't
+    // cancel between this and `n`, so flat surfaces self-occluded.
     var front_back_horizon = vec2(
-        fast_acos(dot(normalize(delta_position), view_vec)),
-        fast_acos(dot(normalize(delta_position_back_face), view_vec)),
+        acos(clamp(dot(normalize(delta_position), view_vec), -1.0, 1.0)),
+        acos(clamp(dot(normalize(delta_position_back_face), view_vec), -1.0, 1.0)),
     );
 
     front_back_horizon = saturate(fma(vec2(sampling_direction), -front_back_horizon * (1.0 / PI), n));
@@ -151,7 +158,9 @@ fn ssao(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let noise = load_noise(pixel_coordinates);
     let safe_radius = max(settings.radius, 0.0001);
-    let sample_scale = (-0.5 * safe_radius * view.clip_from_view[0][0]) / pixel_position.z;
+    // Per-axis UV radius. A single (x-derived) scale for both axes makes the sampled screen line
+    // anisotropic on a non-square view, so diagonal slices sample off their own slice plane.
+    let sample_scale = (-0.5 * safe_radius * vec2<f32>(view.clip_from_view[0][0], view.clip_from_view[1][1])) / pixel_position.z;
 
     var visibility = 0.0;
     var occluded_sample_count = 0u;
@@ -162,13 +171,15 @@ fn ssao(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         let direction = vec3<f32>(omega.xy, 0.0);
         let orthographic_direction = direction - (dot(direction, view_vec) * view_vec);
-        let axis = cross(direction, view_vec);
+        // Normalized: off-center `direction` isn't perpendicular to `view_vec`, and an
+        // unnormalized axis projects the normal onto the wrong plane.
+        let axis = normalize(cross(direction, view_vec));
         let projected_normal = pixel_normal - axis * dot(pixel_normal, axis);
         let projected_normal_length = length(projected_normal);
 
         let sign_norm = sign(dot(orthographic_direction, projected_normal));
         let cos_norm = saturate(dot(projected_normal, view_vec) / projected_normal_length);
-        let n = vec2((HALF_PI - sign_norm * fast_acos(cos_norm)) * (1.0 / PI));
+        let n = vec2((HALF_PI - sign_norm * acos(cos_norm)) * (1.0 / PI));
 
         var bitmask = 0u;
 
