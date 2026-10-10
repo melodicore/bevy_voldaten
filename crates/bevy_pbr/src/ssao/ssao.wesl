@@ -96,6 +96,17 @@ fn load_and_reconstruct_view_space_position(uv: vec2<f32>, sample_mip_level: f32
     return reconstruct_view_space_position(depth, uv);
 }
 
+// Occlusion strength by how far the occluder rises above the pixel's own tangent plane (view-space
+// units): a sample at the plane occludes at `OCCLUDER_MIN_STRENGTH`, ramping (smoothstep) to full
+// strength at `OCCLUDER_FULL_HEIGHT`. This softens shallow self-occlusion (gentle creases, small
+// steps and bumps) while a real occluder such as the other wall of a corner keeps full strength.
+// Height is measured along the normal, not the view direction, so a flat face receding from the
+// camera doesn't count as a depth change. Each sector takes the strongest sample covering it,
+// quantized to `STRENGTH_LEVELS` bitmasks (mask `k` holds the sectors of strength > k / levels).
+const OCCLUDER_FULL_HEIGHT = 0.375;
+const OCCLUDER_MIN_STRENGTH = 1.0 / 3.0;
+const STRENGTH_LEVELS = 6u;
+
 fn updateSectors(
     min_horizon: f32,
     max_horizon: f32,
@@ -116,10 +127,11 @@ fn updateSectors(
 fn processSample(
     delta_position: vec3<f32>,
     view_vec: vec3<f32>,
+    pixel_normal: vec3<f32>,
     sampling_direction: f32,
     n: vec2<f32>,
     samples_per_slice: f32,
-    bitmask: ptr<function, u32>,
+    bitmasks: ptr<function, array<u32, STRENGTH_LEVELS>>,
 ) {
     let delta_position_back_face = delta_position - view_vec * settings.thickness;
 
@@ -135,7 +147,15 @@ fn processSample(
     front_back_horizon = saturate(fma(vec2(sampling_direction), -front_back_horizon * (1.0 / PI), n));
     front_back_horizon = select(front_back_horizon.xy, front_back_horizon.yx, sampling_direction >= 0.0);
 
-    *bitmask = updateSectors(front_back_horizon.x, front_back_horizon.y, samples_per_slice, *bitmask);
+    let sectors = updateSectors(front_back_horizon.x, front_back_horizon.y, samples_per_slice, 0u);
+    let height = dot(delta_position, pixel_normal);
+    let strength = mix(OCCLUDER_MIN_STRENGTH, 1.0, smoothstep(0.0, OCCLUDER_FULL_HEIGHT, height));
+    let levels = u32(round(strength * f32(STRENGTH_LEVELS)));
+    // Constant trip count, so the loop unrolls and the masks stay in registers (a strength-dependent
+    // bound makes the array index dynamic, which can push the array out to scratch memory).
+    for (var level = 0u; level < STRENGTH_LEVELS; level += 1u) {
+        (*bitmasks)[level] |= select(0u, sectors, level < levels);
+    }
 }
 
 @compute
@@ -163,7 +183,7 @@ fn ssao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let sample_scale = (-0.5 * safe_radius * vec2<f32>(view.clip_from_view[0][0], view.clip_from_view[1][1])) / pixel_position.z;
 
     var visibility = 0.0;
-    var occluded_sample_count = 0u;
+    var occluded_sample_count = 0.0;
     for (var slice_t = 0.0; slice_t < slice_count; slice_t += 1.0) {
         let slice = slice_t + noise.x;
         let phi = (PI / slice_count) * slice;
@@ -181,7 +201,7 @@ fn ssao(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let cos_norm = saturate(dot(projected_normal, view_vec) / projected_normal_length);
         let n = vec2((HALF_PI - sign_norm * acos(cos_norm)) * (1.0 / PI));
 
-        var bitmask = 0u;
+        var bitmasks = array<u32, STRENGTH_LEVELS>();
 
         let sample_mul = vec2<f32>(omega.x, -omega.y) * sample_scale;
         for (var sample_t = 0.0; sample_t < samples_per_slice_side; sample_t += 1.0) {
@@ -200,14 +220,18 @@ fn ssao(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let sample_difference_1 = sample_position_1 - pixel_position;
             let sample_difference_2 = sample_position_2 - pixel_position;
 
-            processSample(sample_difference_1, view_vec, -1.0, n, samples_per_slice_side * 2.0, &bitmask);
-            processSample(sample_difference_2, view_vec, 1.0, n, samples_per_slice_side * 2.0, &bitmask);
+            processSample(sample_difference_1, view_vec, pixel_normal, -1.0, n, samples_per_slice_side * 2.0, &bitmasks);
+            processSample(sample_difference_2, view_vec, pixel_normal, 1.0, n, samples_per_slice_side * 2.0, &bitmasks);
         }
 
-        occluded_sample_count += countOneBits(bitmask);
+        var occluded_levels = 0u;
+        for (var level = 0u; level < STRENGTH_LEVELS; level += 1u) {
+            occluded_levels += countOneBits(bitmasks[level]);
+        }
+        occluded_sample_count += f32(occluded_levels) / f32(STRENGTH_LEVELS);
     }
 
-    visibility = 1.0 - f32(occluded_sample_count) / (slice_count * 2.0 * samples_per_slice_side);
+    visibility = 1.0 - occluded_sample_count / (slice_count * 2.0 * samples_per_slice_side);
 
     visibility = clamp(visibility, 0.03, 1.0);
 
