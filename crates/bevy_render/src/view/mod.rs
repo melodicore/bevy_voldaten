@@ -1024,6 +1024,13 @@ impl ViewTarget {
         self.out_texture.as_ref().map(|t| t.view_format)
     }
 
+    /// The HDR output that the final texture of this view is shown as, if it is, see
+    /// [`OutputColorAttachment::hdr`].
+    #[inline]
+    pub fn out_texture_hdr(&self) -> Option<HdrOutput> {
+        self.out_texture.as_ref().and_then(|t| t.hdr)
+    }
+
     /// This will start a new "post process write", which assumes that the caller
     /// will write the [`PostProcessWrite`]'s `source` to the `destination`.
     ///
@@ -1333,11 +1340,21 @@ pub fn prepare_view_attachments(
         match view_target_attachments.entry(target.clone()) {
             Entry::Occupied(_) => {}
             Entry::Vacant(entry) => {
+                // A window that shows HDR output has what is written to it encoded and scaled.
+                let hdr = match target {
+                    NormalizedRenderTarget::Window(window_ref) => windows
+                        .iter()
+                        .find(|(entity, _)| *entity == window_ref.entity())
+                        .and_then(|(_, window)| window.hdr_output()),
+                    _ => None,
+                };
                 let Some(attachment) = target
                     .get_texture_view(&windows, &images, &manual_texture_views)
                     .cloned()
                     .zip(target.get_texture_view_format(&windows, &images, &manual_texture_views))
-                    .map(|(view, format)| OutputColorAttachment::new(view.clone(), format))
+                    .map(|(view, format)| {
+                        OutputColorAttachment::new(view.clone(), format).with_hdr(hdr)
+                    })
                 else {
                     continue;
                 };
@@ -1360,7 +1377,7 @@ pub fn cleanup_view_targets_for_resize(
     for (entity, camera) in &cameras {
         if let Some(NormalizedRenderTarget::Window(window_ref)) = &camera.target
             && let Some((_, window)) = windows.iter().find(|(e, _)| *e == window_ref.entity())
-            && (window.size_changed || window.present_mode_changed)
+            && (window.size_changed || window.present_mode_changed || window.hdr_output_changed)
         {
             commands.entity(entity).remove::<ViewTarget>();
         }

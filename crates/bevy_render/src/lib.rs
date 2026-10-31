@@ -11,6 +11,10 @@
 //! - `WGPU_SETTINGS_PRIO=webgpu` uses webgpu limits.
 //! - `VERBOSE_SHADER_ERROR=1` prints more detailed information about WGSL compilation errors, such as shader defs and shader entrypoint.
 
+// The auto trait checks of wgpu's deep types, such as the `Send` and `Sync` of its wrapped values,
+// exceed the default recursion limit of the compiler, which it now warns about
+// (https://github.com/rust-lang/rust/issues/159228).
+#![recursion_limit = "256"]
 #![expect(missing_docs, reason = "Not all docs are written yet, see #3492.")]
 #![expect(unsafe_code, reason = "Unsafe code is used to improve performance.")]
 #![cfg_attr(

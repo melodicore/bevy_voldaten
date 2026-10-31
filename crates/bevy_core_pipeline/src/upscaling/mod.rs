@@ -94,6 +94,8 @@ fn prepare_view_upscaling_pipelines(
             blend_state,
             samples: 1,
             source_space: ResolvedCompositingSpace::space(resolved_space),
+            // A window that shows HDR output needs the colors encoded and scaled for it.
+            hdr: view_target.out_texture_hdr().map(|hdr| hdr.encoding),
         };
 
         if maybe_pipeline.is_none_or(|ViewUpscalingPipeline(_, cached_key)| *cached_key != key) {

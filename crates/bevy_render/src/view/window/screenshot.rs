@@ -323,6 +323,7 @@ fn prepare_screenshots(
     targets: Res<RenderScreenshotTargets>,
     mut prepared: ResMut<RenderScreenshotsPrepared>,
     window_surfaces: Query<(MainEntity, &SurfaceData)>,
+    extracted_windows: Query<(MainEntity, &ExtractedWindow)>,
     render_device: Res<RenderDevice>,
     screenshot_pipeline: Res<ScreenshotToScreenPipeline>,
     pipeline_cache: Res<PipelineCache>,
@@ -358,9 +359,14 @@ fn prepare_screenshots(
                     &mut pipelines,
                 );
                 prepared.insert(*entity, state);
+                // What the window shows, which is encoded for HDR output while it shows it.
+                let hdr = extracted_windows
+                    .iter()
+                    .find(|(e, _)| *e == window)
+                    .and_then(|(_, w)| w.hdr_output());
                 view_target_attachments.insert(
                     target.clone(),
-                    OutputColorAttachment::new(texture_view.clone(), view_format),
+                    OutputColorAttachment::new(texture_view.clone(), view_format).with_hdr(hdr),
                 );
             }
             NormalizedRenderTarget::Image(image) => {

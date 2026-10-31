@@ -3,9 +3,10 @@ use bevy_app::{App, Plugin};
 use bevy_asset::{embedded_asset, load_embedded_asset, AssetServer, Handle};
 use bevy_camera::CompositingSpace;
 use bevy_ecs::prelude::*;
+use bevy_math::Vec4;
 use bevy_render::{
     render_resource::{
-        binding_types::{sampler, texture_2d},
+        binding_types::{sampler, texture_2d, uniform_buffer},
         *,
     },
     renderer::RenderDevice,
@@ -13,6 +14,7 @@ use bevy_render::{
 };
 use bevy_shader::Shader;
 use bevy_utils::default;
+use bevy_window::HdrEncoding;
 
 /// Adds support for specialized "blit pipelines", which can be used to write one texture to another.
 pub struct BlitPlugin;
@@ -35,6 +37,9 @@ impl Plugin for BlitPlugin {
 #[derive(Resource)]
 pub struct BlitPipeline {
     pub layout: BindGroupLayoutDescriptor,
+    /// The layout of a blit to a window that shows HDR output, whose third binding is the
+    /// brightness of `1.0` in nits.
+    pub scaled_layout: BindGroupLayoutDescriptor,
     pub sampler: Sampler,
     pub fullscreen_shader: FullscreenShader,
     pub fragment_shader: Handle<Shader>,
@@ -57,10 +62,23 @@ pub fn init_blit_pipeline(
         ),
     );
 
+    let scaled_layout = BindGroupLayoutDescriptor::new(
+        "blit_scaled_bind_group_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                sampler(SamplerBindingType::NonFiltering),
+                uniform_buffer::<Vec4>(false),
+            ),
+        ),
+    );
+
     let sampler = render_device.create_sampler(&SamplerDescriptor::default());
 
     commands.insert_resource(BlitPipeline {
         layout,
+        scaled_layout,
         sampler,
         fullscreen_shader: fullscreen_shader.clone(),
         fragment_shader: load_embedded_asset!(asset_server.as_ref(), "blit.wesl"),
@@ -68,6 +86,26 @@ pub fn init_blit_pipeline(
 }
 
 impl BlitPipeline {
+    /// The bind group of a blit with the key's `hdr`: `paper_white` holds the brightness of `1.0`
+    /// in nits in its first component.
+    pub fn create_hdr_bind_group(
+        &self,
+        render_device: &RenderDevice,
+        src_texture: &TextureView,
+        paper_white: &Buffer,
+        pipeline_cache: &PipelineCache,
+    ) -> BindGroup {
+        render_device.create_bind_group(
+            None,
+            &pipeline_cache.get_bind_group_layout(&self.scaled_layout),
+            &BindGroupEntries::sequential((
+                src_texture,
+                &self.sampler,
+                paper_white.as_entire_buffer_binding(),
+            )),
+        )
+    }
+
     pub fn create_bind_group(
         &self,
         render_device: &RenderDevice,
@@ -84,6 +122,9 @@ impl BlitPipeline {
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct BlitPipelineKey {
+    /// The encoding the color is converted to, for a window that shows HDR output, whose
+    /// brightness of `1.0` is the third binding, see [`BlitPipeline::create_hdr_bind_group`].
+    pub hdr: Option<HdrEncoding>,
     pub target_format: TextureFormat,
     pub blend_state: Option<BlendState>,
     pub samples: u32,
@@ -97,6 +138,17 @@ impl SpecializedRenderPipeline for BlitPipeline {
 
     fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
         let mut shader_defs = Vec::new();
+        match key.hdr {
+            Some(HdrEncoding::Pq) => {
+                shader_defs.push("HDR_OUTPUT".into());
+                shader_defs.push("HDR_PQ".into());
+            }
+            Some(HdrEncoding::ScRgb) => {
+                shader_defs.push("HDR_OUTPUT".into());
+                shader_defs.push("HDR_SCRGB".into());
+            }
+            None => {}
+        }
         match key.source_space {
             Some(CompositingSpace::Srgb) => shader_defs.push("SRGB_TO_LINEAR".into()),
             Some(CompositingSpace::Oklab) => shader_defs.push("OKLAB_TO_LINEAR".into()),
@@ -105,7 +157,11 @@ impl SpecializedRenderPipeline for BlitPipeline {
 
         RenderPipelineDescriptor {
             label: Some("blit pipeline".into()),
-            layout: vec![self.layout.clone()],
+            layout: vec![if key.hdr.is_some() {
+                self.scaled_layout.clone()
+            } else {
+                self.layout.clone()
+            }],
             vertex: self.fullscreen_shader.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: self.fragment_shader.clone(),

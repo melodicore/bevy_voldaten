@@ -10,9 +10,12 @@ use bevy_app::{App, Plugin};
 use bevy_ecs::prelude::*;
 use bevy_ecs::system::RunSystemOnce;
 use bevy_log::{debug, info, warn};
+use bevy_platform::collections::HashMap;
+use bevy_platform::sync::{Arc, Mutex};
 use bevy_utils::default;
 use bevy_window::{
-    CompositeAlphaMode, PresentMode, PrimaryWindow, RawHandleWrapper, Window, WindowClosing,
+    CompositeAlphaMode, HdrEncoding, PresentMode, PrimaryWindow, RawHandleWrapper, Window,
+    WindowClosing,
 };
 use core::num::NonZero;
 use wgpu::{
@@ -23,11 +26,143 @@ pub mod screenshot;
 
 use screenshot::ScreenshotPlugin;
 
+/// The brightness of `1.0` in scRGB, in nits.
+pub const SCRGB_WHITE_NITS: f32 = 80.0;
+
+/// Which windows have a surface that can show HDR output, see [`Window::hdr_output`].
+///
+/// It is shared by the main world and the render world: the render world, which owns the
+/// surfaces, sets it when it creates or reconfigures one, and the main world reads it to decide
+/// whether to ask for HDR and to make its cameras [`Hdr`](bevy_camera::Hdr). A window whose
+/// surface does not exist yet is not supported.
+#[derive(Resource, Clone, Default)]
+pub struct WindowHdrSupport(Arc<Mutex<HashMap<Entity, bool>>>);
+
+impl WindowHdrSupport {
+    /// Whether the surface of `window` can show HDR output.
+    pub fn supported(&self, window: Entity) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|windows| windows.get(&window).copied().unwrap_or(false))
+    }
+
+    fn set(&self, window: Entity, supported: bool) {
+        if let Ok(mut windows) = self.0.lock() {
+            windows.insert(window, supported);
+        }
+    }
+}
+
+/// How a window shows HDR output, see [`Window::hdr_output`]: the encoding it uses and the
+/// brightness, in nits, of what is `1.0` in what is written to it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct HdrOutput {
+    pub encoding: HdrEncoding,
+    pub paper_white_nits: f32,
+}
+
+/// The HDR encodings a surface can show.
+#[derive(Clone, Copy, Debug)]
+struct HdrSupport {
+    pq: bool,
+    scrgb: bool,
+}
+
+impl HdrSupport {
+    fn of(caps: &wgpu::SurfaceCapabilities) -> Self {
+        Self {
+            pq: caps
+                .color_spaces(TextureFormat::Rgb10a2Unorm)
+                .contains(wgpu::SurfaceColorSpaces::BT2100_PQ),
+            scrgb: caps
+                .color_spaces(TextureFormat::Rgba16Float)
+                .contains(wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.pq || self.scrgb
+    }
+
+    /// The encoding for a window with these settings: the one it wants if the surface supports
+    /// it, else the other one if that is supported, and none if it does not want HDR output.
+    fn choose(self, hdr_output: bool, requested: HdrEncoding) -> Option<HdrEncoding> {
+        if !hdr_output {
+            return None;
+        }
+        let other = match requested {
+            HdrEncoding::Pq => HdrEncoding::ScRgb,
+            HdrEncoding::ScRgb => HdrEncoding::Pq,
+        };
+        [requested, other]
+            .into_iter()
+            .find(|encoding| match encoding {
+                HdrEncoding::Pq => self.pq,
+                HdrEncoding::ScRgb => self.scrgb,
+            })
+    }
+}
+
+/// The format of a surface that shows SDR, with the format of the views of its textures: an sRGB
+/// format if the surface has one, else the first it has, so that shaders write linear values.
+fn sdr_format(caps: &wgpu::SurfaceCapabilities) -> (TextureFormat, Option<TextureFormat>) {
+    let mut format = *caps
+        .formats
+        .first()
+        .expect("No supported formats for surface");
+    for available_format in &caps.formats {
+        // Rgba8UnormSrgb and Bgra8UnormSrgb and the only sRGB formats wgpu exposes that we can use for surfaces.
+        if *available_format == TextureFormat::Rgba8UnormSrgb
+            || *available_format == TextureFormat::Bgra8UnormSrgb
+        {
+            format = *available_format;
+            break;
+        }
+    }
+    let texture_view_format = if !format.is_srgb() {
+        Some(format.add_srgb_suffix())
+    } else {
+        None
+    };
+    (format, texture_view_format)
+}
+
+/// The format, color space and view format of the textures of a surface with `caps`, for HDR
+/// output with the encoding `hdr` if there is one, which `caps` must support.
+fn surface_format(
+    caps: &wgpu::SurfaceCapabilities,
+    hdr: Option<HdrEncoding>,
+) -> (
+    TextureFormat,
+    wgpu::SurfaceColorSpace,
+    Option<TextureFormat>,
+) {
+    if let Some(encoding) = hdr {
+        match encoding {
+            HdrEncoding::Pq => (
+                TextureFormat::Rgb10a2Unorm,
+                wgpu::SurfaceColorSpace::Bt2100Pq,
+                None,
+            ),
+            HdrEncoding::ScRgb => (
+                TextureFormat::Rgba16Float,
+                wgpu::SurfaceColorSpace::ExtendedSrgbLinear,
+                None,
+            ),
+        }
+    } else {
+        let (format, view_format) = sdr_format(caps);
+        (format, wgpu::SurfaceColorSpace::Auto, view_format)
+    }
+}
+
 pub struct WindowRenderPlugin;
 
 impl Plugin for WindowRenderPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ScreenshotPlugin);
+        let hdr_support = WindowHdrSupport::default();
+        app.insert_resource(hdr_support.clone());
 
         // We need to sync the window entity in the render world
         // We can't use [`SyncComponentPlugin`] because it would introduce `bevy_render` as
@@ -50,6 +185,7 @@ impl Plugin for WindowRenderPlugin {
         }
 
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.insert_resource(hdr_support);
             render_app
                 .add_systems(ExtractSchedule, extract_windows.before(extract_cameras))
                 .add_systems(
@@ -80,6 +216,17 @@ pub struct ExtractedWindow {
     pub swap_chain_texture_view_format: Option<TextureFormat>,
     pub size_changed: bool,
     pub present_mode_changed: bool,
+    /// [`Window::hdr_output`], as requested.
+    pub hdr_output: bool,
+    /// [`Window::hdr_encoding`], as requested.
+    pub hdr_encoding: HdrEncoding,
+    /// [`Window::hdr_paper_white_nits`].
+    pub hdr_paper_white_nits: f32,
+    /// Whether [`hdr_output`](Self::hdr_output) changed since the last frame.
+    pub hdr_output_changed: bool,
+    /// The encoding of the HDR output the surface shows now, if it was requested and the surface
+    /// supports it.
+    pub hdr_active: Option<HdrEncoding>,
     pub alpha_mode: CompositeAlphaMode,
     /// Whether this window needs an initial buffer commit.
     ///
@@ -89,6 +236,14 @@ pub struct ExtractedWindow {
 }
 
 impl ExtractedWindow {
+    /// The HDR output the window shows now, if it does.
+    pub fn hdr_output(&self) -> Option<HdrOutput> {
+        self.hdr_active.map(|encoding| HdrOutput {
+            encoding,
+            paper_white_nits: self.hdr_paper_white_nits,
+        })
+    }
+
     fn set_swapchain_texture(&mut self, frame: wgpu::SurfaceTexture) {
         self.swap_chain_texture_view_format = Some(frame.texture.format().add_srgb_suffix());
         let texture_view_descriptor = TextureViewDescriptor {
@@ -148,6 +303,11 @@ fn extract_windows(
                     swap_chain_texture_format: None,
                     swap_chain_texture_view_format: None,
                     present_mode_changed: false,
+                    hdr_output: window.hdr_output,
+                    hdr_encoding: window.hdr_encoding,
+                    hdr_paper_white_nits: window.hdr_paper_white_nits,
+                    hdr_output_changed: false,
+                    hdr_active: None,
                     alpha_mode: window.composite_alpha_mode,
                     needs_initial_present: true,
                 },
@@ -188,6 +348,12 @@ fn extract_windows(
             );
             extracted_window.present_mode = window.present_mode;
         }
+
+        extracted_window.hdr_output_changed = window.hdr_output != extracted_window.hdr_output
+            || window.hdr_encoding != extracted_window.hdr_encoding;
+        extracted_window.hdr_output = window.hdr_output;
+        extracted_window.hdr_encoding = window.hdr_encoding;
+        extracted_window.hdr_paper_white_nits = window.hdr_paper_white_nits;
     }
 
     // Remove the components instead of despawn the synced render entity here:
@@ -232,6 +398,8 @@ pub struct SurfaceData {
     surface: WgpuSurface,
     configuration: SurfaceConfiguration,
     texture_view_format: Option<TextureFormat>,
+    /// The encoding of the HDR output the surface is configured for, if it is.
+    hdr: Option<HdrEncoding>,
 }
 
 /// (re)configures window surfaces, and obtains a swapchain texture for rendering.
@@ -282,7 +450,11 @@ pub fn prepare_windows(
         };
 
         // We didn't present the previous frame, so we can keep using our existing swapchain texture.
-        if window.has_swapchain_texture() && !window.size_changed && !window.present_mode_changed {
+        if window.has_swapchain_texture()
+            && !window.size_changed
+            && !window.present_mode_changed
+            && !window.hdr_output_changed
+        {
             continue;
         }
 
@@ -351,7 +523,11 @@ pub fn prepare_windows(
 
 pub fn need_surface_configuration(windows: Query<(&ExtractedWindow, Has<SurfaceData>)>) -> bool {
     for (window, has_surface_data) in &windows {
-        if !has_surface_data || window.size_changed || window.present_mode_changed {
+        if !has_surface_data
+            || window.size_changed
+            || window.present_mode_changed
+            || window.hdr_output_changed
+        {
             return true;
         }
     }
@@ -372,6 +548,7 @@ pub fn create_surfaces(
     #[cfg(any(target_os = "macos", target_os = "ios"))] _marker: bevy_ecs::system::NonSendMarker,
     mut windows: Query<(
         Entity,
+        MainEntity,
         &mut ExtractedWindow,
         &RawHandleWrapper,
         Option<&mut SurfaceData>,
@@ -379,8 +556,9 @@ pub fn create_surfaces(
     render_instance: Res<RenderInstance>,
     render_adapter: Res<RenderAdapter>,
     render_device: Res<RenderDevice>,
+    hdr_support: Res<WindowHdrSupport>,
 ) {
-    for (entity, mut window, handle, mut maybe_surface_data) in &mut windows {
+    for (entity, main_entity, mut window, handle, mut maybe_surface_data) in &mut windows {
         let Some(data) = maybe_surface_data.as_mut() else {
             let surface_target = SurfaceTargetUnsafe::RawHandle {
                 raw_display_handle: Some(handle.get_display_handle()),
@@ -396,26 +574,13 @@ pub fn create_surfaces(
             };
             let caps = surface.get_capabilities(&render_adapter);
             let present_mode = present_mode(&window, &caps);
-            let formats = caps.formats;
-            // For future HDR output support, we'll need to request a format that supports HDR,
-            // but as of wgpu 0.15 that is not yet supported.
+            let supported = HdrSupport::of(&caps);
+            hdr_support.set(main_entity, supported.any());
+            let hdr = supported.choose(window.hdr_output, window.hdr_encoding);
+            window.hdr_active = hdr;
             // Prefer sRGB formats for surfaces, but fall back to first available format if no sRGB formats are available.
-            let mut format = *formats.first().expect("No supported formats for surface");
-            for available_format in formats {
-                // Rgba8UnormSrgb and Bgra8UnormSrgb and the only sRGB formats wgpu exposes that we can use for surfaces.
-                if available_format == TextureFormat::Rgba8UnormSrgb
-                    || available_format == TextureFormat::Bgra8UnormSrgb
-                {
-                    format = available_format;
-                    break;
-                }
-            }
-
-            let texture_view_format = if !format.is_srgb() {
-                Some(format.add_srgb_suffix())
-            } else {
-                None
-            };
+            // HDR output is `Rgba16Float` in scRGB, where shaders write linear values as well.
+            let (format, color_space, texture_view_format) = surface_format(&caps, hdr);
             let configuration = SurfaceConfiguration {
                 format,
                 width: window.physical_width,
@@ -437,7 +602,7 @@ pub fn create_surfaces(
                     Some(format) => vec![format],
                     None => vec![],
                 },
-                color_space: wgpu::SurfaceColorSpace::Auto,
+                color_space,
             };
 
             render_device.configure_surface(&surface, &configuration);
@@ -446,11 +611,12 @@ pub fn create_surfaces(
                 surface: WgpuSurface::new(surface),
                 configuration,
                 texture_view_format,
+                hdr,
             });
             continue;
         };
 
-        if window.size_changed || window.present_mode_changed {
+        if window.size_changed || window.present_mode_changed || window.hdr_output_changed {
             // normally this is dropped on present but we double check here to be safe as failure to
             // drop it will cause validation errors in wgpu
             drop(window.swap_chain_texture.take());
@@ -464,6 +630,19 @@ pub fn create_surfaces(
             data.configuration.height = window.physical_height;
             let caps = data.surface.get_capabilities(&render_adapter);
             data.configuration.present_mode = present_mode(&window, &caps);
+            let supported = HdrSupport::of(&caps);
+            hdr_support.set(main_entity, supported.any());
+            let hdr = supported.choose(window.hdr_output, window.hdr_encoding);
+            if hdr != data.hdr {
+                let (format, color_space, texture_view_format) = surface_format(&caps, hdr);
+                data.configuration.format = format;
+                data.configuration.color_space = color_space;
+                data.configuration.view_formats = texture_view_format.into_iter().collect();
+                data.texture_view_format = texture_view_format;
+                data.hdr = hdr;
+                info!("Window HDR output is {hdr:?}");
+            }
+            window.hdr_active = data.hdr;
             render_device.configure_surface(&data.surface, &data.configuration);
         }
     }

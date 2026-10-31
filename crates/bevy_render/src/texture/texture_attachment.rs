@@ -1,5 +1,6 @@
 use super::CachedTexture;
 use crate::render_resource::{TextureFormat, TextureView};
+use crate::view::window::HdrOutput;
 use alloc::sync::Arc;
 use bevy_color::LinearRgba;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -405,6 +406,10 @@ impl DepthStencilViewAttachment {
 pub struct OutputColorAttachment {
     pub view: TextureView,
     pub view_format: TextureFormat,
+    /// The HDR output the texture is shown as, if it is the surface of a window that shows it:
+    /// what is written to it is encoded and scaled for it, see
+    /// [`Window::hdr_output`](bevy_window::Window::hdr_output).
+    pub hdr: Option<HdrOutput>,
     is_first_call: Arc<AtomicBool>,
 }
 
@@ -413,8 +418,15 @@ impl OutputColorAttachment {
         Self {
             view,
             view_format,
+            hdr: None,
             is_first_call: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// This attachment as the `hdr` output that it is shown as.
+    pub fn with_hdr(mut self, hdr: Option<HdrOutput>) -> Self {
+        self.hdr = hdr;
+        self
     }
 
     /// Get this texture view as an attachment. The attachment will be cleared with a value of
