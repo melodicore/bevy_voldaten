@@ -4,14 +4,19 @@ use bevy_ecs::prelude::*;
 use bevy_render::{
     camera::ExtractedCamera,
     diagnostic::RecordDiagnostics,
-    render_resource::{BindGroup, PipelineCache, RenderPassDescriptor, TextureViewId},
+    render_resource::{
+        BindGroup, BufferInitDescriptor, BufferUsages, PipelineCache, RenderPassDescriptor,
+        TextureViewId,
+    },
     renderer::{RenderContext, ViewQuery},
-    view::ViewTarget,
+    view::{window::HdrOutput, ViewTarget},
 };
 
 #[derive(Default)]
 pub struct UpscalingBindGroupCache {
-    cached: Option<(TextureViewId, BindGroup)>,
+    /// The view of the texture that was upscaled, the HDR output it was converted for, and the
+    /// bind group for them.
+    cached: Option<(TextureViewId, Option<HdrOutput>, BindGroup)>,
 }
 
 pub fn upscaling(
@@ -46,16 +51,41 @@ pub fn upscaling(
     // texture to be upscaled to the output texture
     let main_texture_view = target.main_texture_view();
 
-    let bind_group = match &mut cache.cached {
-        Some((id, bind_group)) if main_texture_view.id() == *id => bind_group,
-        cached => {
-            let bind_group = blit_pipeline.create_bind_group(
-                ctx.render_device(),
-                main_texture_view,
-                &pipeline_cache,
-            );
+    // The HDR output of the window, if it shows it.
+    let hdr = target.out_texture_hdr();
 
-            let (_, bind_group) = cached.insert((main_texture_view.id(), bind_group));
+    let bind_group = match &mut cache.cached {
+        Some((id, cached_hdr, bind_group))
+            if main_texture_view.id() == *id && hdr == *cached_hdr =>
+        {
+            bind_group
+        }
+        cached => {
+            let bind_group = if let Some(hdr) = hdr {
+                let mut contents = [0u8; 16];
+                contents[..4].copy_from_slice(&hdr.paper_white_nits.to_ne_bytes());
+                let buffer = ctx
+                    .render_device()
+                    .create_buffer_with_data(&BufferInitDescriptor {
+                        label: Some("upscaling_hdr_paper_white"),
+                        contents: &contents,
+                        usage: BufferUsages::UNIFORM,
+                    });
+                blit_pipeline.create_hdr_bind_group(
+                    ctx.render_device(),
+                    main_texture_view,
+                    &buffer,
+                    &pipeline_cache,
+                )
+            } else {
+                blit_pipeline.create_bind_group(
+                    ctx.render_device(),
+                    main_texture_view,
+                    &pipeline_cache,
+                )
+            };
+
+            let (_, _, bind_group) = cached.insert((main_texture_view.id(), hdr, bind_group));
             bind_group
         }
     };

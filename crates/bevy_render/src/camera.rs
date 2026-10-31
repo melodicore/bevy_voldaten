@@ -620,6 +620,15 @@ pub fn extract_cameras(
                 TextureFormat::Rgba16Float
             } else if compositing_space.is_some_and(|s| *s == CompositingSpace::Srgb) {
                 TextureFormat::Rgba8Unorm
+            } else if matches!(
+                output_texture_format,
+                TextureFormat::Rgba16Float | TextureFormat::Rgb10a2Unorm
+            ) {
+                // A window that shows HDR output has a surface of one of these formats, which a
+                // camera without `Hdr` does not render to: it keeps the SDR format it has with
+                // any other window, and what it renders is converted when it is written to the
+                // surface.
+                TextureFormat::Rgba8UnormSrgb
             } else {
                 output_texture_format
             };

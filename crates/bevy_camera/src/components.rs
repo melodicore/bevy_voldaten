@@ -81,9 +81,15 @@ impl From<Camera3dDepthLoadOp> for LoadOp<f32> {
 }
 
 /// If this component is added to a camera, the camera will use an intermediate "high dynamic range" render texture.
-/// This allows rendering with a wider range of lighting values. However, this does *not* affect
-/// whether the camera will render with hdr display output (which bevy does not support currently)
-/// and only affects the intermediate render texture.
+/// This allows rendering with a wider range of lighting values. However, this does *not* by itself
+/// affect whether the camera will render with hdr display output and only affects the intermediate
+/// render texture.
+///
+/// HDR display output is a setting of the window the camera targets, `Window::hdr_output`. While
+/// the window's surface shows it, what the camera's main texture holds is shown without being
+/// limited to `0..=1`, so a camera with this component and no tonemapping shows values above `1`
+/// brighter than SDR white. Without this component the main texture has a format that cannot hold
+/// them, and the output is limited to `0..=1`.
 #[derive(Component, Default, Copy, Clone, Reflect, PartialEq, Eq, Hash, Debug)]
 #[reflect(Component, Default, PartialEq, Hash, Debug)]
 pub struct Hdr;

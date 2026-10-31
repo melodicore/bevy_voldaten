@@ -330,6 +330,36 @@ pub struct Window {
     /// [`wgpu::SurfaceConfiguration::desired_maximum_frame_latency`]:
     /// https://docs.rs/wgpu/latest/wgpu/type.SurfaceConfiguration.html#structfield.desired_maximum_frame_latency
     pub desired_maximum_frame_latency: Option<NonZero<u32>>,
+    /// Requests HDR output for the window's surface.
+    ///
+    /// When the surface supports it, it is configured for HDR with the [`hdr_encoding`] and the
+    /// final output of the window is encoded for it, with `1.0` as the white of an SDR image, see
+    /// [`hdr_paper_white_nits`], and values above it brighter, as far as the display goes.
+    /// Cameras that target the window then show the values of their main texture without
+    /// limiting them to `0..=1`, so a camera that wants to show them needs the [`Hdr`] component
+    /// and no tonemapping. Whether the surface can do it is
+    /// reported to the main world by `WindowHdrSupport` of `bevy_render`; where it cannot, the
+    /// request has no effect and the surface is configured as it is without it.
+    ///
+    /// Changing this reconfigures the surface, as changing the size does.
+    ///
+    /// [`hdr_encoding`]: Window::hdr_encoding
+    /// [`hdr_paper_white_nits`]: Window::hdr_paper_white_nits
+    /// [`Hdr`]: https://docs.rs/bevy/latest/bevy/camera/struct.Hdr.html
+    pub hdr_output: bool,
+    /// How HDR output is sent to the display, see [`HdrEncoding`]. It is only used while
+    /// [`hdr_output`](Window::hdr_output) is on. An encoding that the surface does not support is
+    /// replaced by the other one if that is supported.
+    pub hdr_encoding: HdrEncoding,
+    /// The brightness, in nits, that the white of an SDR image has while the window shows HDR
+    /// output: [`hdr_output`](Window::hdr_output) is on and the surface supports it. What is shown
+    /// is scaled so that `1.0` has this brightness: [`HdrEncoding::Pq`] is absolute, and the
+    /// scRGB color space of [`HdrEncoding::ScRgb`] defines `1.0` as 80 nits.
+    ///
+    /// Neither the operating systems nor `wgpu` tell this on every platform, so it is a setting.
+    /// The default is 203, the reference white of ITU-R BT.2408. It is not used without HDR
+    /// output.
+    pub hdr_paper_white_nits: f32,
     /// Sets whether this window recognizes [`PinchGesture`](https://docs.rs/bevy/latest/bevy/input/gestures/struct.PinchGesture.html)
     ///
     /// ## Platform-specific
@@ -505,6 +535,9 @@ impl Default for Window {
             skip_taskbar: false,
             clip_children: true,
             desired_maximum_frame_latency: None,
+            hdr_output: false,
+            hdr_encoding: HdrEncoding::default(),
+            hdr_paper_white_nits: 203.0,
             recognize_pinch_gesture: false,
             recognize_rotation_gesture: false,
             recognize_doubletap_gesture: false,
@@ -1182,6 +1215,31 @@ pub enum VideoModeSelection {
     /// Uses a given [`VideoMode`](`crate::monitor::VideoMode`). A list of video modes supported by the monitor
     /// is supplied by [`Monitor::video_modes`](`crate::monitor::Monitor::video_modes`).
     Specific(VideoMode),
+}
+
+/// How a window shows HDR output, see [`Window::hdr_output`].
+#[derive(Default, Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "bevy_reflect",
+    derive(Reflect),
+    reflect(Debug, PartialEq, Hash, Clone)
+)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    all(feature = "serialize", feature = "bevy_reflect"),
+    reflect(Serialize, Deserialize)
+)]
+pub enum HdrEncoding {
+    /// HDR10: a 10-bit surface with BT.2020 primaries and the PQ (ST 2084) transfer function,
+    /// whose values are absolute luminances. It is what video players use, and what compositors
+    /// and displays are most likely to handle well.
+    #[default]
+    Pq,
+    /// scRGB: a half-float surface with BT.709 primaries and a linear transfer function, in which
+    /// `1.0` is 80 nits and values may be negative or above `1.0`. Some drivers describe it to the
+    /// compositor with a maximum luminance of its white, which makes the compositor limit what is
+    /// above it.
+    ScRgb,
 }
 
 /// Presentation mode for a [`Window`].
